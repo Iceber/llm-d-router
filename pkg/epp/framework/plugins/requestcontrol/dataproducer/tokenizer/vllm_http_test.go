@@ -51,23 +51,29 @@ func newHTTPRenderer(t *testing.T, srv *httptest.Server) *vllmHTTPRenderer {
 	return r
 }
 
-// httpFixture mimics vLLM's /render endpoints and captures request bodies.
+// httpFixture mimics vLLM's /render endpoints and captures request bodies
+// and Authorization headers.
 func httpFixture(t *testing.T, completionsResp []renderResponse, chatResp renderResponse) (*httptest.Server, *httpCaptured) {
 	t.Helper()
 	cap := &httpCaptured{}
 	mux := http.NewServeMux()
 	mux.HandleFunc(completionsRenderPath, func(w http.ResponseWriter, r *http.Request) {
 		cap.completions, _ = io.ReadAll(r.Body)
+		cap.completionsAuth = r.Header.Get("Authorization")
 		_ = json.NewEncoder(w).Encode(completionsResp)
 	})
 	mux.HandleFunc(chatRenderPath, func(w http.ResponseWriter, r *http.Request) {
 		cap.chat, _ = io.ReadAll(r.Body)
+		cap.chatAuth = r.Header.Get("Authorization")
 		_ = json.NewEncoder(w).Encode(chatResp)
 	})
 	return httptest.NewServer(mux), cap
 }
 
-type httpCaptured struct{ completions, chat []byte }
+type httpCaptured struct {
+	completions, chat         []byte
+	completionsAuth, chatAuth string
+}
 
 func TestVLLMHTTPRenderer_Render(t *testing.T) {
 	srv, cap := httpFixture(t,
@@ -320,6 +326,45 @@ func TestProduce_MessagesVLLMHTTPFullAgenticTurn(t *testing.T) {
 	assert.Equal(t, "tool", toolResult["role"])
 	assert.Equal(t, "toolu_01", toolResult["tool_call_id"])
 	assert.Equal(t, "Sunny, 22C", toolResult["content"])
+}
+
+func TestProduce_VLLMHTTPForwardsAuthorization(t *testing.T) {
+	srv, cap := httpFixture(t,
+		[]renderResponse{{TokenIDs: []uint32{1}}}, renderResponse{TokenIDs: []uint32{2}})
+	defer srv.Close()
+
+	p := newTestPlugin(newHTTPRenderer(t, srv))
+
+	authReq := func() *scheduling.InferenceRequest {
+		return &scheduling.InferenceRequest{
+			Headers: map[string]string{"authorization": "Bearer secret-token"},
+			Body: &fwkrh.InferenceRequestBody{
+				ChatCompletions: &fwkrh.ChatCompletionsRequest{
+					Messages: []fwkrh.Message{{Role: "user", Content: fwkrh.Content{Raw: "hi"}}},
+				},
+			},
+		}
+	}
+
+	require.NoError(t, p.Produce(context.Background(), authReq(), nil))
+	assert.Equal(t, "Bearer secret-token", cap.chatAuth)
+
+	completions := authReq()
+	completions.Body = &fwkrh.InferenceRequestBody{
+		Completions: &fwkrh.CompletionsRequest{Prompt: fwkrh.Prompt{Raw: "hello"}},
+	}
+	require.NoError(t, p.Produce(context.Background(), completions, nil))
+	assert.Equal(t, "Bearer secret-token", cap.completionsAuth)
+
+	cap.chatAuth = ""
+	require.NoError(t, p.Produce(context.Background(), &scheduling.InferenceRequest{
+		Body: &fwkrh.InferenceRequestBody{
+			ChatCompletions: &fwkrh.ChatCompletionsRequest{
+				Messages: []fwkrh.Message{{Role: "user", Content: fwkrh.Content{Raw: "hi"}}},
+			},
+		},
+	}, nil))
+	assert.Empty(t, cap.chatAuth, "request without Authorization must not send one")
 }
 
 func TestVLLMHTTPRenderer_RenderMultiPrompt(t *testing.T) {

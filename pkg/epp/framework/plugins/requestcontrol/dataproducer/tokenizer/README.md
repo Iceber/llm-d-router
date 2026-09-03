@@ -106,7 +106,10 @@ The plugin calls `POST {http}/v1/completions/render` and
 `vllm serve <model>` and by the GPU-less `vllm launch render <model>`.
 Any reachable HTTP endpoint serving the same model the scheduler tokenizes
 for will work — sidecar in the EPP pod (loopback) or a dedicated Service
-shared by multiple EPP replicas.
+shared by multiple EPP replicas. When the inbound request carries an
+`Authorization` header, it is forwarded verbatim on render requests, so an
+endpoint started with `--api-key` accepts them; the startup warmup probe
+sends no `Authorization` header.
 
 ```yaml
 # EPP pod spec

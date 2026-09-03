@@ -56,6 +56,21 @@ const (
 // pre-marshaled chat message (multimodal parts).
 var arrayContentMarker = []byte(`"content":[`)
 
+// authHeaderCtxKey carries the inbound request's Authorization header from
+// Plugin.Produce to the render call without widening tokenInputProducer.produce.
+type authHeaderCtxKey struct{}
+
+// withAuthHeader returns ctx carrying the Authorization header value verbatim.
+func withAuthHeader(ctx context.Context, value string) context.Context {
+	return context.WithValue(ctx, authHeaderCtxKey{}, value)
+}
+
+// authHeaderFromContext returns the Authorization header value on ctx, or "".
+func authHeaderFromContext(ctx context.Context) string {
+	value, _ := ctx.Value(authHeaderCtxKey{}).(string)
+	return value
+}
+
 // vllmConfig configures the vLLM /render backend. Future protocol fields
 // (e.g., grpc) can be added alongside url.
 type vllmConfig struct {
@@ -358,6 +373,11 @@ func (r *vllmHTTPRenderer) postJSON(ctx context.Context, path string, body any, 
 		return fmt.Errorf("build request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	// The render endpoint may require the same credential as inference;
+	// forward the inbound Authorization when present.
+	if auth := authHeaderFromContext(ctx); auth != "" {
+		httpReq.Header.Set("Authorization", auth)
+	}
 
 	httpResp, err := r.client.Do(httpReq)
 	if err != nil {
