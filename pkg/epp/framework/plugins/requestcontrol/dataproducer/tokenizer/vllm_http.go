@@ -71,6 +71,22 @@ func authHeaderFromContext(ctx context.Context) string {
 	return value
 }
 
+// renderStatusError is a non-2xx response from the render endpoint.
+type renderStatusError struct {
+	StatusCode int
+	Body       string
+}
+
+func (e *renderStatusError) Error() string {
+	return fmt.Sprintf("vLLM render returned status %d: %s", e.StatusCode, e.Body)
+}
+
+// isRenderAuthError reports whether err carries a 401 or 403 render response.
+func isRenderAuthError(err error) bool {
+	var se *renderStatusError
+	return errors.As(err, &se) && (se.StatusCode == http.StatusUnauthorized || se.StatusCode == http.StatusForbidden)
+}
+
 // vllmConfig configures the vLLM /render backend. Future protocol fields
 // (e.g., grpc) can be added alongside url.
 type vllmConfig struct {
@@ -387,7 +403,7 @@ func (r *vllmHTTPRenderer) postJSON(ctx context.Context, path string, body any, 
 
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		snippet, _ := io.ReadAll(io.LimitReader(httpResp.Body, maxErrorBodySnippetBytes))
-		return fmt.Errorf("vLLM render returned status %d: %s", httpResp.StatusCode, string(snippet))
+		return &renderStatusError{StatusCode: httpResp.StatusCode, Body: string(snippet)}
 	}
 	if err := json.NewDecoder(httpResp.Body).Decode(out); err != nil {
 		return fmt.Errorf("unmarshal response: %w", err)

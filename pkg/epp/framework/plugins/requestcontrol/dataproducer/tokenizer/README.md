@@ -109,7 +109,8 @@ for will work — sidecar in the EPP pod (loopback) or a dedicated Service
 shared by multiple EPP replicas. When the inbound request carries an
 `Authorization` header, it is forwarded verbatim on render requests, so an
 endpoint started with `--api-key` accepts them; the startup warmup probe
-sends no `Authorization` header.
+sends no `Authorization` header, so against such an endpoint it is skipped
+and the first request pays the cold-start cost.
 
 ```yaml
 # EPP pod spec

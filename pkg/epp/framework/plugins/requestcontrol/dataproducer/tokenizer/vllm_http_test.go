@@ -367,6 +367,38 @@ func TestProduce_VLLMHTTPForwardsAuthorization(t *testing.T) {
 	assert.Empty(t, cap.chatAuth, "request without Authorization must not send one")
 }
 
+func TestRenderBackend_WarmupStopsOnAuthRejection(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		status     int
+		wantsRetry bool
+	}{
+		{name: "401 gives up", status: http.StatusUnauthorized},
+		{name: "403 gives up", status: http.StatusForbidden},
+		{name: "503 retries", status: http.StatusServiceUnavailable, wantsRetry: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				calls++
+				w.WriteHeader(tc.status)
+			}))
+			defer srv.Close()
+
+			ctx, cancel := context.WithTimeout(context.Background(), warmupRetryInterval/2)
+			defer cancel()
+			renderBackend{tk: newHTTPRenderer(t, srv)}.warmup(ctx)
+
+			assert.Equal(t, 1, calls)
+			if tc.wantsRetry {
+				assert.ErrorIs(t, ctx.Err(), context.DeadlineExceeded, "non-auth failure must keep retrying until ctx ends")
+			} else {
+				assert.NoError(t, ctx.Err(), "auth failure must return before the retry interval")
+			}
+		})
+	}
+}
+
 func TestVLLMHTTPRenderer_RenderMultiPrompt(t *testing.T) {
 	srv, _ := httpFixture(t,
 		[]renderResponse{
