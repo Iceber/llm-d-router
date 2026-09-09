@@ -408,6 +408,22 @@ func TestRenderBackend_WarmupStopsOnAuthRejection(t *testing.T) {
 	}
 }
 
+func TestRenderBackend_WarmupUsesAPIKeyEnv(t *testing.T) {
+	srv, cap := httpFixture(t,
+		[]renderResponse{{TokenIDs: []uint32{1}}}, renderResponse{TokenIDs: []uint32{2}})
+	defer srv.Close()
+
+	t.Setenv(vllmAPIKeyEnvVar, "warmup-secret")
+	r := newHTTPRenderer(t, srv)
+
+	ctx, cancel := context.WithTimeout(context.Background(), warmupRetryInterval/2)
+	defer cancel()
+	renderBackend{tk: r, warmupAuth: vllmWarmupAuthHeader()}.warmup(ctx) // wired as in NewPlugin
+
+	assert.Equal(t, "Bearer warmup-secret", cap.chatAuth)
+	assert.NoError(t, ctx.Err(), "warmup must succeed and return before the retry interval")
+}
+
 func TestVLLMHTTPRenderer_RenderMultiPrompt(t *testing.T) {
 	srv, _ := httpFixture(t,
 		[]renderResponse{

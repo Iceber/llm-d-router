@@ -305,7 +305,7 @@ func NewPlugin(ctx context.Context, name string, config *tokenizerPluginConfig) 
 		if err != nil {
 			return nil, fmt.Errorf("failed to initialize vLLM HTTP renderer for '%s' plugin - %w", PluginType, err)
 		}
-		backend = renderBackend{tk: renderer}
+		backend = renderBackend{tk: renderer, warmupAuth: vllmWarmupAuthHeader()}
 		backendName = backendVLLM
 	default:
 		backend = estimateBackend{img: newImageEstimator(config.Estimate), vid: newVideoEstimator(config.Estimate)}

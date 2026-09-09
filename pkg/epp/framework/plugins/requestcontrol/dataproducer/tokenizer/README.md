@@ -107,9 +107,13 @@ Any reachable HTTP endpoint serving the same model the scheduler tokenizes
 for will work — sidecar in the EPP pod (loopback) or a dedicated Service
 shared by multiple EPP replicas. When the inbound request carries an
 `Authorization` header, it is forwarded verbatim on render requests, so an
-endpoint started with `--api-key` accepts them; the startup warmup probe
-sends no `Authorization` header, so against such an endpoint it is skipped
-and the first request pays the cold-start cost.
+endpoint started with `--api-key` accepts them; a bad token then fails at
+render, the same way it fails at inference.
+
+The startup warmup probe has no inbound request to borrow a credential
+from. When `VLLM_API_KEY` is set on the EPP container, the probe sends
+`Authorization: Bearer $VLLM_API_KEY`; the variable is warmup-only, and
+request paths keep forwarding the client's `Authorization` header.
 
 ```yaml
 # EPP pod spec
@@ -165,6 +169,36 @@ containers:
     - "--port=8000"
     - "--ssl-certfile=/path/to/tls.crt"
     - "--ssl-keyfile=/path/to/tls.key"
+```
+
+When the render endpoint requires a key — a `vllm launch render` endpoint
+or a `vllm serve` instance started with `--api-key` — start the render
+container with the key and expose it to the EPP container via
+`VLLM_API_KEY` so the warmup probe authenticates:
+
+```yaml
+# vllm-api-key is the same Secret the endpoint reads its --api-key from
+containers:
+- name: epp
+  env:
+  - name: VLLM_API_KEY
+    valueFrom:
+      secretKeyRef:
+        name: vllm-api-key
+        key: api-key
+- name: vllm-render
+  image: vllm/vllm-openai:latest
+  command: ["vllm", "launch", "render"]
+  args:
+    - "${MODEL_NAME}"
+    - "--port=8000"
+    - "--api-key=$(VLLM_API_KEY)"
+  env:
+  - name: VLLM_API_KEY
+    valueFrom:
+      secretKeyRef:
+        name: vllm-api-key
+        key: api-key
 ```
 
 A complete sample config that pairs this with `precise-prefix-cache-producer` and `prefix-cache-scorer` is at [`deploy/config/sim-epp-tokenizer-vllm-http-config.yaml`](../../../../../../../deploy/config/sim-epp-tokenizer-vllm-http-config.yaml).
