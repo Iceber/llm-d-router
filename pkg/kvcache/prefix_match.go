@@ -37,8 +37,12 @@ import (
 // same chain.
 const SpeculativeTier = "speculative"
 
-// defaultTierWeight scores blocks held in a tier without a configured weight.
-const defaultTierWeight = 1.0
+// speculativeTierWeight scores speculative entries when the speculative tier
+// has no configured weight.
+const speculativeTierWeight = 1.0
+
+// unknownTierWeight scores blocks held in a tier without a configured weight.
+const unknownTierWeight = 0.0
 
 // matchCancellationMask paces context-cancellation checks over key
 // positions: positions where pos&mask == 0 poll ctx.Err().
@@ -48,8 +52,9 @@ const matchCancellationMask = 255
 // the contiguous chain of keys the pod holds, counted from the first key.
 type PodMatch struct {
 	// WeightedScore sums, per block of the chain, the highest device-tier
-	// weight among the pod's entries for that block; tiers without a
-	// configured weight count defaultTierWeight.
+	// weight among the pod's entries for that block. Tiers without a
+	// configured weight count unknownTierWeight; speculative entries count
+	// speculativeTierWeight unless the speculative tier is configured.
 	WeightedScore float64
 	// MatchedBlocks is the chain length in blocks, regardless of tier.
 	MatchedBlocks int
@@ -352,7 +357,12 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 		}
 		slot := &a.slots[s]
 
-		w := a.weightOf(ref.DeviceTier, ref.TierOrdinal)
+		tier, tierOrdinal := ref.DeviceTier, ref.TierOrdinal
+		if ref.Speculative || ref.DeviceTier == SpeculativeTier {
+			tier, tierOrdinal = SpeculativeTier, speculativeTierOrdinal
+		}
+
+		w := a.weightOf(tier, tierOrdinal)
 		switch {
 		case slot.seen != a.keyStamp:
 			slot.seen = a.keyStamp
@@ -361,10 +371,6 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 			slot.weight = w
 		}
 
-		tier, tierOrdinal := ref.DeviceTier, ref.TierOrdinal
-		if ref.Speculative || ref.DeviceTier == SpeculativeTier {
-			tier, tierOrdinal = SpeculativeTier, speculativeTierOrdinal
-		}
 		if !a.stampTier(slot, tierOrdinal) && a.first {
 			slot.tiers = append(slot.tiers, tierChain{ordinal: tierOrdinal, name: tier, seen: a.keyStamp, alive: true})
 		}
@@ -460,7 +466,10 @@ func (a *prefixAccumulator) weightOf(tier string, ordinal uint32) float64 {
 			return a.weightCache[i].weight
 		}
 	}
-	w := defaultTierWeight
+	w := unknownTierWeight
+	if tier == SpeculativeTier {
+		w = speculativeTierWeight
+	}
 	if configured, ok := a.weights[tier]; ok {
 		w = configured
 	}
