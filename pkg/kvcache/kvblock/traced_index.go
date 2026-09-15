@@ -104,6 +104,7 @@ func (t *tracedIndex) Evict(ctx context.Context, keyType KeyType, keys []BlockHa
 
 	span.SetAttributes(
 		semconv.LLMDKVCacheIndexEvictKeyType(keyTypeLabel(keyType)),
+		semconv.LLMDKVCacheIndexEvictKeyCount(len(keys)),
 		semconv.LLMDKVCacheIndexEvictPodEntryCount(len(entries)),
 		semconv.LLMDKVCacheIndexEvictDeviceTierCount(deviceTierCount(entries)),
 	)

@@ -140,6 +140,7 @@ func TestTracedIndexAddAndEvictSpans(t *testing.T) {
 	evictSpan := spanByName(t, spans, "index_evict")
 	evictAttrs := spanAttributes(evictSpan)
 	require.Equal(t, "engine", evictAttrs[semconv.LLMDKVCacheIndexEvictKeyTypeKey].AsString())
+	require.Equal(t, int64(1), evictAttrs[semconv.LLMDKVCacheIndexEvictKeyCountKey].AsInt64())
 	require.Equal(t, int64(1), evictAttrs[semconv.LLMDKVCacheIndexEvictPodEntryCountKey].AsInt64())
 	require.Equal(t, int64(1), evictAttrs[semconv.LLMDKVCacheIndexEvictDeviceTierCountKey].AsInt64())
 }
