@@ -300,7 +300,8 @@ func TestZMQSubscriber_ReceivesMessages(t *testing.T) {
 	require.NoError(t, err)
 	tokenProcessor, err := kvblock.NewChunkedTokenDatabase(kvblock.DefaultTokenProcessorConfig())
 	require.NoError(t, err)
-	pool := kvevents.NewPool(kvevents.DefaultConfig(), index, tokenProcessor, engineadapter.NewVLLMAdapter())
+	pool, err := kvevents.NewPool(kvevents.DefaultConfig(), index, tokenProcessor, engineadapter.NewVLLMAdapter())
+	require.NoError(t, err)
 	pool.Start(ctx)
 
 	// Start subscriber — remote=false means it binds (Listen).
@@ -342,7 +343,8 @@ func TestZMQSubscribers_SameTopicUsesServingEndpointIdentity(t *testing.T) {
 	require.NoError(t, err)
 	tokenProcessor, err := kvblock.NewChunkedTokenDatabase(kvblock.DefaultTokenProcessorConfig())
 	require.NoError(t, err)
-	pool := kvevents.NewPool(kvevents.DefaultConfig(), index, tokenProcessor, engineadapter.NewVLLMAdapter())
+	pool, err := kvevents.NewPool(kvevents.DefaultConfig(), index, tokenProcessor, engineadapter.NewVLLMAdapter())
+	require.NoError(t, err)
 	pool.Start(ctx)
 
 	subManager := kvevents.NewSubscriberManager(pool)
@@ -423,7 +425,8 @@ func TestZMQSubscriber_ShortSequenceFrameSkipped(t *testing.T) {
 	require.NoError(t, err)
 	tokenProcessor, err := kvblock.NewChunkedTokenDatabase(kvblock.DefaultTokenProcessorConfig())
 	require.NoError(t, err)
-	pool := kvevents.NewPool(kvevents.DefaultConfig(), index, tokenProcessor, engineadapter.NewVLLMAdapter())
+	pool, err := kvevents.NewPool(kvevents.DefaultConfig(), index, tokenProcessor, engineadapter.NewVLLMAdapter())
+	require.NoError(t, err)
 	pool.Start(ctx)
 
 	// Pick an available ephemeral port to avoid conflicts with parallel tests or CI.
@@ -489,7 +492,8 @@ func newReplayHarnessWithBehavior(
 	require.NoError(t, err)
 	tokenProcessor, err := kvblock.NewChunkedTokenDatabase(kvblock.DefaultTokenProcessorConfig())
 	require.NoError(t, err)
-	pool := kvevents.NewPool(kvevents.DefaultConfig(), index, tokenProcessor, engineadapter.NewVLLMAdapter())
+	pool, err := kvevents.NewPool(kvevents.DefaultConfig(), index, tokenProcessor, engineadapter.NewVLLMAdapter())
+	require.NoError(t, err)
 	pool.Start(ctx)
 
 	pubEndpoint := availableEndpoint(t, ctx)
