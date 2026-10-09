@@ -76,7 +76,7 @@ var _ = Describe("Data Parallel support", func() {
 				DataParallelSize:     testDataParallelSize,
 				EnableSSRFProtection: true,
 			})
-			proxy.allowlistValidator, _ = newTestAllowlistValidator()
+			proxy.allowlistValidator = newTestAllowlistValidator()
 			proxy.HTTPListener = listeners[0]
 			proxy.DataParallelListeners = listeners[1:]
 			ctx, cancel := context.WithCancel(newTestContext())

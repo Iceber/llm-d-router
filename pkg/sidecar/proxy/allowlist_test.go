@@ -51,7 +51,8 @@ import (
 	"k8s.io/utils/set"
 )
 
-func newTestAllowlistValidator() (*AllowlistValidator, *dynamicfake.FakeDynamicClient) {
+// newTestAllowlistValidator creates an enabled validator with a fake Kubernetes client.
+func newTestAllowlistValidator() *AllowlistValidator {
 	GinkgoHelper()
 	clientfeaturestesting.SetFeatureDuringTest(GinkgoTB(), clientfeatures.WatchListClient, false)
 	poolGVR := schema.GroupVersionResource{Group: routing.InferencePoolAPIGroup, Version: "v1", Resource: inferencePoolResource}
@@ -72,7 +73,7 @@ func newTestAllowlistValidator() (*AllowlistValidator, *dynamicfake.FakeDynamicC
 		poolPorts:      make(map[string][]string),
 		stopCh:         make(chan struct{}),
 	}
-	return validator, client
+	return validator
 }
 
 var _ = Describe("AllowlistValidator", func() {
@@ -80,7 +81,7 @@ var _ = Describe("AllowlistValidator", func() {
 		var validator *AllowlistValidator
 
 		BeforeEach(func() {
-			validator, _ = newTestAllowlistValidator()
+			validator = newTestAllowlistValidator()
 			DeferCleanup(validator.Stop)
 		})
 
