@@ -33,16 +33,77 @@ limitations under the License.
 package proxy
 
 import (
+	"context"
+	"errors"
+	"sync"
+	"time"
+
 	. "github.com/onsi/ginkgo/v2" // nolint:revive
 	. "github.com/onsi/gomega"    // nolint:revive
 
 	"github.com/llm-d/llm-d-router/pkg/common/routing"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
+	clientfeatures "k8s.io/client-go/features"
+	clientfeaturestesting "k8s.io/client-go/features/testing"
+	clienttesting "k8s.io/client-go/testing"
 	"k8s.io/utils/set"
 )
 
 var _ = Describe("AllowlistValidator", func() {
+	DescribeTable("should interrupt cache synchronization", func(stopValidator bool) {
+		clientfeaturestesting.SetFeatureDuringTest(GinkgoTB(), clientfeatures.WatchListClient, false)
+		poolGVR := schema.GroupVersionResource{Group: routing.InferencePoolAPIGroup, Version: "v1", Resource: inferencePoolResource}
+		client := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), map[schema.GroupVersionResource]string{
+			poolGVR: "InferencePoolList",
+		})
+		received := make(chan struct{}, 1)
+		client.PrependReactor("list", inferencePoolResource, func(clienttesting.Action) (bool, runtime.Object, error) {
+			select {
+			case received <- struct{}{}:
+			default:
+			}
+			return true, nil, errors.New("pool list failed")
+		})
+		validator := &AllowlistValidator{
+			enabled:       true,
+			dynamicClient: client,
+			namespace:     "test",
+			poolName:      "test",
+			gvr:           poolGVR,
+			stopCh:        make(chan struct{}),
+		}
+		ctx, cancel := context.WithCancel(newTestContext())
+		stop := sync.OnceFunc(validator.Stop)
+		done := make(chan struct{})
+		var startErr error
+		go func() {
+			defer close(done)
+			startErr = validator.Start(ctx)
+		}()
+		DeferCleanup(func() {
+			cancel()
+			stop()
+			Eventually(done, time.Second).Should(BeClosed())
+		})
+		Eventually(received, 3*time.Second).Should(Receive())
+		if stopValidator {
+			stop()
+		} else {
+			cancel()
+		}
+		Eventually(done, time.Second).Should(BeClosed())
+		Expect(startErr).To(HaveOccurred())
+		if !stopValidator {
+			Expect(startErr).To(MatchError(context.Canceled))
+		}
+	},
+		Entry("when the context is canceled", false),
+		Entry("when the validator is stopped", true),
+	)
+
 	Context("when SSRF protection is disabled", func() {
 		var validator *AllowlistValidator
 
