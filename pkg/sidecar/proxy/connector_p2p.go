@@ -172,19 +172,7 @@ func (s *Server) handleP2PSequentialRequests(w http.ResponseWriter, r *http.Requ
 	if prefillFailed {
 		// Return the prefill error verbatim; decode is never dispatched, so it
 		// cannot fetch KV that was never stored.
-		for key, values := range pw.Header() {
-			for _, v := range values {
-				w.Header().Add(key, v)
-			}
-		}
-		status := pw.statusCode
-		if status < http.StatusContinue {
-			// The prefiller never wrote a status (transport failure before the
-			// proxy's error handler ran). WriteHeader panics below 100.
-			status = http.StatusBadGateway
-		}
-		w.WriteHeader(status)
-		if _, writeErr := w.Write(pw.bodyBytes()); writeErr != nil {
+		if writeErr := pw.relayTo(w); writeErr != nil {
 			s.logger.Error(writeErr, "failed to send prefill error to client")
 		}
 		return

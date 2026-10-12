@@ -58,6 +58,26 @@ func (w *bufferedResponseWriter) bodyBytes() []byte {
 	return w.buffer.Bytes()
 }
 
+// relayTo writes the buffered status, headers and body to dst verbatim. A
+// status below 100 means the upstream handler never wrote one (a transport
+// failure before the proxy's error handler ran); WriteHeader panics on it, so
+// it is relayed as 502.
+func (w *bufferedResponseWriter) relayTo(dst http.ResponseWriter) error {
+	dstHeader := dst.Header()
+	for key, values := range w.Header() {
+		for _, v := range values {
+			dstHeader.Add(key, v)
+		}
+	}
+	status := w.statusCode
+	if status < http.StatusContinue {
+		status = http.StatusBadGateway
+	}
+	dst.WriteHeader(status)
+	_, err := dst.Write(w.bodyBytes())
+	return err
+}
+
 // responseStatus records the final status code written through a writer
 // returned by captureResponseStatus and whether any body write failed, so a
 // streamed response (SSE included) can be observed for error metrics without

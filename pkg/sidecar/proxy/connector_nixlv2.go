@@ -254,13 +254,7 @@ retryLoop:
 		prefillSpan.SetStatus(codes.Error, "prefill request failed")
 		prefillSpan.End()
 
-		for key, values := range pw.Header() {
-			for _, v := range values {
-				w.Header().Add(key, v)
-			}
-		}
-		w.WriteHeader(pw.statusCode)
-		if _, writeErr := w.Write(pw.bodyBytes()); writeErr != nil {
+		if writeErr := pw.relayTo(w); writeErr != nil {
 			s.logger.Error(writeErr, "failed to send error response to client")
 		}
 		return
@@ -801,26 +795,18 @@ func (s *Server) runNIXLProtocolV2WriteParallel(
 		dcw.abort()
 		metrics.RecordError(metrics.StagePrefill)
 		status := http.StatusBadGateway
-		if prefillResp != nil {
-			status = prefillResp.statusCode
-			for key, values := range prefillResp.Header() {
-				for _, v := range values {
-					w.Header().Add(key, v)
-				}
-			}
-		}
 		bodyBytes := 0
 		if prefillResp != nil {
+			status = prefillResp.statusCode
 			bodyBytes = prefillResp.buffer.Len()
 		}
 		s.logger.Info("concurrent-dispatch: prefill failed; returning prefill error and aborting decode",
 			"request_id", uuidStr, "p_status", status, logBodyBytesKey, bodyBytes)
 		clientResponded = true
-		w.WriteHeader(status)
-		if prefillResp != nil {
-			if _, writeErr := w.Write(prefillResp.bodyBytes()); writeErr != nil {
-				s.logger.Error(writeErr, "failed to send prefill error to client (concurrent-dispatch)")
-			}
+		if prefillResp == nil {
+			w.WriteHeader(status)
+		} else if writeErr := prefillResp.relayTo(w); writeErr != nil {
+			s.logger.Error(writeErr, "failed to send prefill error to client (concurrent-dispatch)")
 		}
 	case <-timer.C:
 		// Prefill did not resolve within the backstop window: cancel both requests
