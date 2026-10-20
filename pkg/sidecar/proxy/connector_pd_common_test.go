@@ -24,6 +24,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -224,7 +225,8 @@ func TestRunConcurrentPDDecodeFailureCancelsPrefill(t *testing.T) {
 }
 
 // A decode that aborts after sending headers (the reverse proxy panics with
-// http.ErrAbortHandler) cancels prefill.
+// http.ErrAbortHandler) cancels prefill. Nothing has reached the client yet,
+// so the abort is answered with a status instead of propagating.
 func TestRunConcurrentPDDecodeAbortCancelsPrefill(t *testing.T) {
 	prefill := newHeldPrefill(t)
 	decoder := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -233,7 +235,7 @@ func TestRunConcurrentPDDecodeAbortCancelsPrefill(t *testing.T) {
 		panic(http.ErrAbortHandler)
 	})
 
-	delta := runConcurrentPDAgainst(context.Background(), t, prefill, decoder, http.ErrAbortHandler)
+	delta := runConcurrentPDAgainst(context.Background(), t, prefill, decoder, nil)
 	assert.Equal(t, stageMetrics{prefillCount: 1, decodeCount: 1, decodeErrors: 1}, delta)
 }
 
@@ -267,6 +269,227 @@ func TestRunConcurrentPDGraceCancelsPrefill(t *testing.T) {
 
 	delta := runConcurrentPDAgainst(context.Background(), t, prefill, decoder, nil)
 	assert.Equal(t, stageMetrics{prefillCount: 1, decodeCount: 1}, delta)
+}
+
+// releasedPrefill is a prefill backend that holds its request until release is
+// called, then answers with the given status, or until the request context
+// ends, recording which came first.
+type releasedPrefill struct {
+	server    *httptest.Server
+	started   chan struct{}
+	releaseCh chan int
+	cancelled atomic.Bool
+}
+
+func newReleasedPrefill(t *testing.T) *releasedPrefill {
+	t.Helper()
+	p := &releasedPrefill{started: make(chan struct{}), releaseCh: make(chan int, 1)}
+	p.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		close(p.started)
+		select {
+		case <-r.Context().Done():
+			p.cancelled.Store(true)
+		case status := <-p.releaseCh:
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte(`{}`))
+		}
+	}))
+	t.Cleanup(p.server.Close)
+	// Cleanup runs last-registered first, so the handler is released before Close waits on it.
+	t.Cleanup(func() { p.release(http.StatusOK) })
+	return p
+}
+
+func (p *releasedPrefill) release(status int) {
+	select {
+	case p.releaseCh <- status:
+	default:
+	}
+}
+
+func (p *releasedPrefill) host() string {
+	return strings.TrimPrefix(p.server.URL, "http://")
+}
+
+func (p *releasedPrefill) waitStarted(t *testing.T) {
+	t.Helper()
+	select {
+	case <-p.started:
+	case <-time.After(concurrentPDTestWait):
+		t.Fatal("prefill request was not dispatched")
+	}
+}
+
+// syncRecorder is a ResponseWriter whose state can be read while the handler
+// is still running; httptest.ResponseRecorder is not safe for that.
+type syncRecorder struct {
+	mu     sync.Mutex
+	header http.Header
+	status int
+	body   bytes.Buffer
+}
+
+func (r *syncRecorder) Header() http.Header {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.header == nil {
+		r.header = make(http.Header)
+	}
+	return r.header
+}
+
+func (r *syncRecorder) WriteHeader(status int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.status == 0 {
+		r.status = status
+	}
+}
+
+func (r *syncRecorder) Write(b []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.status == 0 {
+		r.status = http.StatusOK
+	}
+	return r.body.Write(b)
+}
+
+func (r *syncRecorder) Flush() {}
+
+func (r *syncRecorder) snapshot() (int, string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.status, r.body.String()
+}
+
+const decodeStreamEvent = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"
+
+// runConcurrentPDAsync runs runConcurrentPD against prefillHost on its own
+// goroutine and returns a channel closed when it returns.
+func runConcurrentPDAsync(t *testing.T, w http.ResponseWriter, prefillHost string, decoder http.Handler) <-chan struct{} {
+	t.Helper()
+	decoderURL, err := url.Parse("http://decoder:8000")
+	require.NoError(t, err)
+	s := NewProxy(Config{Port: "0", DecoderURL: decoderURL})
+	s.logger = log.Log
+	s.decoderProxy = decoder
+
+	body := []byte(`{"model":"m","messages":[]}`)
+	req := httptest.NewRequest(http.MethodPost, reqcommon.PathChatCompletions, bytes.NewReader(body))
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.runConcurrentPD(w, req, body, body, prefillHost, constants.KVConnectorMooncake, nil, nil)
+	}()
+	return done
+}
+
+func waitHandlerReturn(t *testing.T, done <-chan struct{}, msg string) {
+	t.Helper()
+	select {
+	case <-done:
+	case <-time.After(concurrentPDTestWait):
+		t.Fatal(msg)
+	}
+}
+
+// A prefill that fails before decode has produced output ends the request:
+// decode is cancelled and the client receives the prefill response verbatim.
+// Decode is not sampled, since its output was discarded.
+func TestRunConcurrentPDPrefillFailureReturnsPrefillError(t *testing.T) {
+	prefill := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		w.Header().Set("X-Prefill-Error", "overloaded")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":"prefill down"}`))
+	}))
+	t.Cleanup(prefill.Close)
+
+	decodeCancelled := make(chan struct{})
+	decoder := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Decode waits for KV that never arrives until the sidecar cancels it.
+		<-r.Context().Done()
+		close(decodeCancelled)
+		w.WriteHeader(http.StatusBadGateway)
+	})
+
+	before := snapshotStageMetrics(t)
+	rec := httptest.NewRecorder()
+	done := runConcurrentPDAsync(t, rec, strings.TrimPrefix(prefill.URL, "http://"), decoder)
+	waitHandlerReturn(t, done, "handler did not return after prefill failed")
+
+	select {
+	case <-decodeCancelled:
+	default:
+		t.Error("decode was not cancelled after prefill failed")
+	}
+	assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	assert.Equal(t, "overloaded", rec.Header().Get("X-Prefill-Error"))
+	assert.Equal(t, `{"error":"prefill down"}`, rec.Body.String())
+	assert.Equal(t, stageMetrics{prefillCount: 1, prefillErrors: 1}, snapshotStageMetrics(t).delta(before))
+}
+
+// Decode output reaches the client as soon as decode produces it; the prefill
+// response, which can lag behind the KV transfer, does not hold it back.
+func TestRunConcurrentPDDecodeStreamsBeforePrefillResponse(t *testing.T) {
+	prefill := newReleasedPrefill(t)
+	decodeRelease := make(chan struct{})
+	decoder := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, decodeStreamEvent)
+		w.(http.Flusher).Flush()
+		<-decodeRelease
+	})
+
+	before := snapshotStageMetrics(t)
+	rec := &syncRecorder{}
+	done := runConcurrentPDAsync(t, rec, prefill.host(), decoder)
+	prefill.waitStarted(t)
+	require.Eventually(t, func() bool {
+		_, body := rec.snapshot()
+		return body == decodeStreamEvent
+	}, concurrentPDTestWait, 10*time.Millisecond, "decode output was held back while prefill had not responded")
+
+	close(decodeRelease)
+	waitHandlerReturn(t, done, "handler did not return after decode completed")
+	prefill.release(http.StatusOK)
+
+	status, _ := rec.snapshot()
+	assert.Equal(t, http.StatusOK, status)
+	require.Eventually(t, func() bool {
+		return snapshotStageMetrics(t).delta(before) == stageMetrics{prefillCount: 1, decodeCount: 1}
+	}, concurrentPDTestWait, 10*time.Millisecond)
+	assert.False(t, prefill.cancelled.Load(), "prefill was cancelled after decode succeeded")
+}
+
+// A prefill that fails after decode's output has reached the client cannot
+// change the response: the stream stays intact and the failure is recorded
+// as a prefill error only.
+func TestRunConcurrentPDLatePrefillFailureKeepsStream(t *testing.T) {
+	prefill := newReleasedPrefill(t)
+	decoder := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, decodeStreamEvent)
+	})
+
+	before := snapshotStageMetrics(t)
+	rec := &syncRecorder{}
+	done := runConcurrentPDAsync(t, rec, prefill.host(), decoder)
+	prefill.waitStarted(t)
+	waitHandlerReturn(t, done, "handler did not return after decode completed")
+
+	prefill.release(http.StatusInternalServerError)
+	require.Eventually(t, func() bool {
+		return snapshotStageMetrics(t).delta(before) == stageMetrics{prefillCount: 1, prefillErrors: 1, decodeCount: 1}
+	}, concurrentPDTestWait, 10*time.Millisecond)
+
+	status, body := rec.snapshot()
+	assert.Equal(t, http.StatusOK, status)
+	assert.Equal(t, decodeStreamEvent, body)
+	assert.False(t, prefill.cancelled.Load(), "a prefill that fails after commit must not be cancelled")
 }
 
 // A prefill that fails after decode has started streaming is informational:

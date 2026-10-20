@@ -1436,45 +1436,69 @@ func TestRunConcurrentPDMetrics(t *testing.T) {
 }
 
 func TestRunConcurrentPDDecodeAbortMetrics(t *testing.T) {
-	prefill := httptest.NewServer(statusHandler(http.StatusOK, `{}`))
-	defer prefill.Close()
-	prefillURL, err := url.Parse(prefill.URL)
-	require.NoError(t, err)
+	tests := []struct {
+		name string
+		// delivered is the body decode writes before the stream breaks; a
+		// body byte commits the response to the client.
+		delivered string
+		wantPanic bool
+	}{
+		{name: "before the response reaches the client", wantPanic: false},
+		{name: "after the response reaches the client", delivered: "data: hi\n\n", wantPanic: true},
+	}
 
-	s := NewProxy(Config{Port: "0", DecoderURL: prefillURL})
-	s.logger = log.Log
-	// The reverse proxy panics with ErrAbortHandler when a stream breaks after
-	// headers were sent.
-	s.decoderProxy = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		panic(http.ErrAbortHandler)
-	})
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			prefill := httptest.NewServer(statusHandler(http.StatusOK, `{}`))
+			defer prefill.Close()
+			prefillURL, err := url.Parse(prefill.URL)
+			require.NoError(t, err)
 
-	before := snapshotStageMetrics(t)
-	beforeFields := toolFieldCounters(t)
-	body := []byte(`{"model":"m","messages":[],"tools":[]}`)
-	toolFields, captureErr := captureToolCallingRequest(reqcommon.APITypeChatCompletions, body)
-	require.NoError(t, captureErr)
-	req := httptest.NewRequest(http.MethodPost, reqcommon.PathChatCompletions, bytes.NewReader(body))
+			s := NewProxy(Config{Port: "0", DecoderURL: prefillURL})
+			s.logger = log.Log
+			// The reverse proxy panics with ErrAbortHandler when a stream breaks after
+			// headers were sent.
+			s.decoderProxy = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusOK)
+				if tt.delivered != "" {
+					_, _ = io.WriteString(w, tt.delivered)
+				}
+				panic(http.ErrAbortHandler)
+			})
 
-	var recovered any
-	func() {
-		defer func() { recovered = recover() }()
-		s.runConcurrentPD(httptest.NewRecorder(), req, body, body, prefillURL.Host, constants.KVConnectorSGLang, nil, toolFields)
-	}()
-	assert.Equal(t, http.ErrAbortHandler, recovered, "abort panic must propagate")
+			before := snapshotStageMetrics(t)
+			beforeFields := toolFieldCounters(t)
+			body := []byte(`{"model":"m","messages":[],"tools":[]}`)
+			toolFields, captureErr := captureToolCallingRequest(reqcommon.APITypeChatCompletions, body)
+			require.NoError(t, captureErr)
+			req := httptest.NewRequest(http.MethodPost, reqcommon.PathChatCompletions, bytes.NewReader(body))
 
-	require.Eventually(t, func() bool {
-		return snapshotStageMetrics(t).delta(before).prefillCount == 1
-	}, 5*time.Second, 10*time.Millisecond)
-	assert.Equal(t, stageMetrics{prefillCount: 1, decodeCount: 1, decodeErrors: 1},
-		snapshotStageMetrics(t).delta(before))
-	for key, value := range toolFieldCounters(t) {
-		want := float64(0)
-		if key == [2]string{string(toolcalling.FieldTools), string(toolcalling.FieldStatusPreserved)} {
-			want = 1
-		}
-		assert.Equal(t, want, value-beforeFields[key], "field outcome %v", key)
+			rec := httptest.NewRecorder()
+			var recovered any
+			func() {
+				defer func() { recovered = recover() }()
+				s.runConcurrentPD(rec, req, body, body, prefillURL.Host, constants.KVConnectorSGLang, nil, toolFields)
+			}()
+			if tt.wantPanic {
+				assert.Equal(t, http.ErrAbortHandler, recovered, "abort panic must propagate once the response is on the wire")
+			} else {
+				assert.Nil(t, recovered)
+				assert.Equal(t, http.StatusBadGateway, rec.Code, "an unstarted response must carry the decode failure")
+			}
+
+			require.Eventually(t, func() bool {
+				return snapshotStageMetrics(t).delta(before).prefillCount == 1
+			}, 5*time.Second, 10*time.Millisecond)
+			assert.Equal(t, stageMetrics{prefillCount: 1, decodeCount: 1, decodeErrors: 1},
+				snapshotStageMetrics(t).delta(before))
+			for key, value := range toolFieldCounters(t) {
+				want := float64(0)
+				if key == [2]string{string(toolcalling.FieldTools), string(toolcalling.FieldStatusPreserved)} {
+					want = 1
+				}
+				assert.Equal(t, want, value-beforeFields[key], "field outcome %v", key)
+			}
+		})
 	}
 }
 

@@ -19,12 +19,10 @@ package proxy
 import (
 	"context"
 	"fmt"
-	"io"
 	"net/http"
 	"sync/atomic"
 	"time"
 
-	"github.com/felixge/httpsnoop"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 
@@ -48,10 +46,14 @@ var concurrentPrefillGrace = 30 * time.Second
 
 // runConcurrentPD fires the prefill and decode requests of a concurrent-dispatch
 // P/D protocol (Mooncake, SGLang) in parallel: prefill runs in a goroutine
-// and its response is discarded (only status and duration are recorded on
-// its span), while decode runs on the calling goroutine and streams its
-// response to w. connector is recorded on both spans to identify the
-// protocol.
+// and only its status and duration are recorded, while decode runs on the
+// calling goroutine and streams its response to w. connector is recorded on
+// both spans to identify the protocol.
+//
+// Decode cannot emit output before the prefill KV has arrived, so its first
+// body byte is the commit point: until then its output is held, and a prefill
+// that fails first cancels decode and is returned to the client verbatim.
+// After it, prefill's HTTP response has only informational value.
 func (s *Server) runConcurrentPD(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -78,8 +80,10 @@ func (s *Server) runConcurrentPD(
 		prepareRequests(prefillReq, decodeReq)
 	}
 
-	// Prefill runs in a goroutine: response is discarded (status/duration only).
-	// Decode runs on the calling goroutine: writes the actual response back via w.
+	// Prefill runs in a goroutine; decode runs on the calling goroutine and
+	// writes the response through dcw.
+	dcw := newDeferredCommitWriter(w)
+	dcw.commitOnWrite = true
 	ctx, prefillSpan := tracer.Start(ctx, "prefill",
 		trace.WithSpanKind(trace.SpanKindInternal),
 	)
@@ -103,9 +107,8 @@ func (s *Server) runConcurrentPD(
 
 	// Aggregate before starting the worker so reporting does not wait for prefill.
 	toolFields.compareDispatchedForSpan(prefillBody, prefillSpan)
-	// Decode cannot emit output before the prefill KV has arrived, so output
-	// proves the KV did arrive and a later prefill failure is informational.
-	var decodeStarted atomic.Bool
+	// Stored before dcw.abort, so a discarded decode can relay it.
+	var prefillResp atomic.Pointer[bufferedResponseWriter]
 	go func() {
 		defer cancelPrefill()
 		defer prefillSpan.End()
@@ -116,6 +119,7 @@ func (s *Server) runConcurrentPD(
 		}()
 		pw := &bufferedResponseWriter{}
 		prefillHandler.ServeHTTP(pw, prefillReq)
+		prefillResp.Store(pw)
 		prefillDuration := time.Since(prefillStart)
 		prefillSpan.SetAttributes(
 			semconv.LLMDPDProxyPrefillStatusCode(pw.statusCode),
@@ -125,11 +129,12 @@ func (s *Server) runConcurrentPD(
 		if isHTTPError(pw.statusCode) && prefillCtx.Err() == nil {
 			metrics.RecordError(metrics.StagePrefill)
 			prefillSpan.SetStatus(codes.Error, "prefill request failed")
-			if decodeStarted.Load() {
-				s.logger.Info("concurrent-dispatch prefill failed after decode started streaming; decode left running",
-					"connector", connector, "status", pw.statusCode)
-			} else {
+			if dcw.abort() {
 				cancelDecode()
+			} else {
+				// Decode output reached the client, so the KV did arrive.
+				s.logger.Info("concurrent-dispatch prefill failed after decode committed; response unchanged",
+					"connector", connector, "status", pw.statusCode)
 			}
 		}
 		metrics.RecordPrefillDuration(prefillDuration)
@@ -145,24 +150,36 @@ func (s *Server) runConcurrentPD(
 	decodeSpan.SetAttributes(
 		semconv.LLMDPDProxyConnector(connector),
 		semconv.LLMDPDProxyDecodeConcurrentWithPrefill(true),
+		semconv.LLMDPDProxyDecodeTarget(s.config.DecoderURL.Host),
 	)
 	decodeStart := time.Now()
+	toolFields.compareDispatchedForSpan(decodeBody, decodeSpan)
 
-	decodeReq = decodeReq.WithContext(ctx)
-	decodeWriter, decodeStatus := captureResponseStatus(w)
-	decodeWriter = markFirstBodyWrite(decodeWriter, &decodeStarted)
-	decodeReturned := false
-	defer recordDecodeAbort(&decodeReturned, decodeStart)
-	defer func() {
-		if prefillCtx.Err() != nil {
-			return
-		}
+	// The reverse proxy panics with http.ErrAbortHandler when a stream breaks
+	// after headers were sent, including when cancelDecode interrupts a body
+	// copy. Recovered so the response is still ours to settle; replayed below
+	// when it reached the client.
+	decodeAborted := false
+	func() {
+		defer func() {
+			if rec := recover(); rec != nil {
+				if rec != http.ErrAbortHandler {
+					panic(rec)
+				}
+				decodeAborted = true
+			}
+		}()
+		s.decoderProxy.ServeHTTP(dcw, decodeReq.WithContext(ctx))
+	}()
+	decodeDuration := time.Since(decodeStart)
+
+	switch {
+	case prefillCtx.Err() != nil:
+	case decodeAborted || dcw.failed():
 		// The request is over once decode has failed; a prefill still running
 		// would compute KV nobody consumes.
-		if !decodeReturned || decodeStatus.failed() {
-			cancelPrefill()
-			return
-		}
+		cancelPrefill()
+	default:
 		// Prefill has no deadline of its own; one that never responds would
 		// hold the goroutine and connection indefinitely.
 		// Not awaited: the client's response must not wait on the prefill response.
@@ -172,21 +189,38 @@ func (s *Server) runConcurrentPD(
 			cancelPrefill()
 		})
 		context.AfterFunc(prefillCtx, func() { graceTimer.Stop() })
-	}()
-	toolFields.compareDispatchedForSpan(decodeBody, decodeSpan)
-	s.decoderProxy.ServeHTTP(decodeWriter, decodeReq)
-	decodeReturned = true
+	}
 
-	decodeDuration := time.Since(decodeStart)
+	if dcw.discarded() {
+		// Prefill failed before decode produced output: the prefill response
+		// owns the client response and decode is not sampled.
+		decodeSpan.SetStatus(codes.Error, "decode cancelled after prefill failure")
+		if writeErr := prefillResp.Load().relayTo(w); writeErr != nil {
+			s.logger.Error(writeErr, "failed to send prefill error to client (concurrent-dispatch)")
+		}
+		return
+	}
+
 	metrics.RecordDecodeDuration(decodeDuration)
-	if decodeStatus.failed() {
+	decodeSpan.SetAttributes(semconv.LLMDPDProxyDecodeDurationMs(float64(decodeDuration.Milliseconds())))
+	if decodeAborted {
+		metrics.RecordError(metrics.StageDecode)
+		decodeSpan.SetStatus(codes.Error, "decode handler aborted")
+		if dcw.responseStarted() {
+			// Already on the wire; net/http drops the connection.
+			panic(http.ErrAbortHandler)
+		}
+		if err := errorBadGateway(errDecodeAborted, w); err != nil {
+			s.logger.Error(err, "failed to send decode abort error to client (concurrent-dispatch)")
+		}
+		return
+	}
+	// A header-only decode response never reached the commit point.
+	dcw.commit()
+	if dcw.failed() {
 		metrics.RecordError(metrics.StageDecode)
 		decodeSpan.SetStatus(codes.Error, "decode request failed")
 	}
-	decodeSpan.SetAttributes(
-		semconv.LLMDPDProxyDecodeDurationMs(float64(decodeDuration.Milliseconds())),
-		semconv.LLMDPDProxyDecodeTarget(s.config.DecoderURL.Host),
-	)
 
 	// End-to-end P/D timing. True TTFT captures time from gateway request start
 	// to decode start; prefill duration is tracked in the async prefill span.
@@ -207,26 +241,6 @@ func (s *Server) runConcurrentPD(
 			semconv.LLMDPDProxyConcurrentPD(true),
 		)
 	}
-}
-
-// markFirstBodyWrite wraps w so started is set before the first body byte is
-// written. Headers alone do not count: the engine sends them before the KV
-// arrives.
-func markFirstBodyWrite(w http.ResponseWriter, started *atomic.Bool) http.ResponseWriter {
-	return httpsnoop.Wrap(w, httpsnoop.Hooks{
-		Write: func(next httpsnoop.WriteFunc) httpsnoop.WriteFunc {
-			return func(b []byte) (int, error) {
-				started.Store(true)
-				return next(b)
-			}
-		},
-		ReadFrom: func(next httpsnoop.ReadFromFunc) httpsnoop.ReadFromFunc {
-			return func(src io.Reader) (int64, error) {
-				started.Store(true)
-				return next(src)
-			}
-		},
-	})
 }
 
 // recordDecodeAbort records decode duration and a decode error when decode

@@ -155,6 +155,12 @@ func (s *responseStatus) failed() bool {
 //     a failed prefill can never let decode emit a (possibly 200) response; the
 //     caller then writes the prefill error to the client directly.
 //
+// With commitOnWrite set, decode's first body write is the commit point: in
+// protocols where decode cannot emit output before the prefill KV has arrived,
+// a body byte proves prefill succeeded, so the output streams without waiting
+// for prefill's HTTP response. A header-only response is still held until the
+// caller commits.
+//
 // It is safe for concurrent use by the decode goroutine (Write/WriteHeader/
 // Flush) and the coordinating goroutine (commit/abort).
 type deferredCommitWriter struct {
@@ -165,6 +171,8 @@ type deferredCommitWriter struct {
 	// the client. aborted: caller decided prefill failed, decode is discarded.
 	committed bool
 	aborted   bool
+	// commitOnWrite makes the first body write commit.
+	commitOnWrite bool
 	// wroteHeader records that decode has produced its status/headers.
 	wroteHeader bool
 	// headerFlushed records that decode's status/headers have been relayed to
@@ -224,6 +232,9 @@ func (w *deferredCommitWriter) Write(b []byte) (int, error) {
 		if w.statusCode == 0 {
 			w.statusCode = http.StatusOK
 		}
+	}
+	if w.commitOnWrite {
+		w.committed = true
 	}
 	if w.committed {
 		if !w.headerFlushed {
@@ -304,18 +315,27 @@ func (w *deferredCommitWriter) commit() bool {
 	return true
 }
 
-// abort discards buffered output and drops all future writes. It is a no-op
-// once decode's response has been relayed to the client, which the
-// concurrent-dispatch decode abort path reaches: the response is already on the
-// wire, so the caller tears the connection down instead.
-func (w *deferredCommitWriter) abort() {
+// abort discards buffered output and drops all future writes, reporting
+// whether it did so. It is a no-op once decode's response has been relayed to
+// the client, which the concurrent-dispatch decode abort path reaches: the
+// response is already on the wire, so the caller tears the connection down
+// instead.
+func (w *deferredCommitWriter) abort() bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.headerFlushed {
-		return
+		return false
 	}
 	w.aborted = true
 	w.buffer.Reset()
+	return true
+}
+
+// discarded reports whether abort dropped decode's output.
+func (w *deferredCommitWriter) discarded() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.aborted
 }
 
 // failed reports whether decode's response carried an error status or could
