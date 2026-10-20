@@ -268,3 +268,55 @@ func TestRunConcurrentPDGraceCancelsPrefill(t *testing.T) {
 	delta := runConcurrentPDAgainst(context.Background(), t, prefill, decoder, nil)
 	assert.Equal(t, stageMetrics{prefillCount: 1, decodeCount: 1}, delta)
 }
+
+// A prefill that fails after decode has started streaming is informational:
+// the KV has arrived, so decode is left running and the stream stays intact.
+func TestRunConcurrentPDLatePrefillFailureKeepsDecode(t *testing.T) {
+	decodeStreaming := make(chan struct{})
+	prefill := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		select {
+		case <-decodeStreaming:
+			w.WriteHeader(http.StatusInternalServerError)
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(prefill.Close)
+
+	before := snapshotStageMetrics(t)
+	decodeRelease := make(chan struct{})
+	var decodeCancelled atomic.Bool
+	decoder := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "data: {}\n\n")
+		close(decodeStreaming)
+		// Hold the stream open until prefill's failure has been processed.
+		require.Eventually(t, func() bool {
+			return snapshotStageMetrics(t).delta(before).prefillErrors == 1
+		}, concurrentPDTestWait, 10*time.Millisecond)
+		select {
+		case <-r.Context().Done():
+			decodeCancelled.Store(true)
+		case <-decodeRelease:
+		}
+	})
+	time.AfterFunc(50*time.Millisecond, func() { close(decodeRelease) })
+
+	decoderURL, err := url.Parse("http://decoder:8000")
+	require.NoError(t, err)
+	s := NewProxy(Config{Port: "0", DecoderURL: decoderURL})
+	s.logger = log.Log
+	s.decoderProxy = decoder
+
+	body := []byte(`{"model":"m","messages":[]}`)
+	req := httptest.NewRequest(http.MethodPost, reqcommon.PathChatCompletions, bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.runConcurrentPD(rec, req, body, body, strings.TrimPrefix(prefill.URL, "http://"), constants.KVConnectorMooncake, nil)
+
+	assert.False(t, decodeCancelled.Load(), "decode was cancelled after it had started streaming")
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, "data: {}\n\n", rec.Body.String())
+	// The prefill duration sample is recorded by the prefill goroutine after its error.
+	require.Eventually(t, func() bool {
+		return snapshotStageMetrics(t).delta(before) == stageMetrics{prefillCount: 1, prefillErrors: 1, decodeCount: 1}
+	}, concurrentPDTestWait, 10*time.Millisecond)
+}

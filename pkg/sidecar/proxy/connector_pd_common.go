@@ -19,9 +19,12 @@ package proxy
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
+	"sync/atomic"
 	"time"
 
+	"github.com/felixge/httpsnoop"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 
@@ -95,6 +98,9 @@ func (s *Server) runConcurrentPD(
 		return
 	}
 
+	// Decode cannot emit output before the prefill KV has arrived, so output
+	// proves the KV did arrive and a later prefill failure is informational.
+	var decodeStarted atomic.Bool
 	go func() {
 		defer cancelPrefill()
 		defer prefillSpan.End()
@@ -114,7 +120,12 @@ func (s *Server) runConcurrentPD(
 		if isHTTPError(pw.statusCode) && prefillCtx.Err() == nil {
 			metrics.RecordError(metrics.StagePrefill)
 			prefillSpan.SetStatus(codes.Error, "prefill request failed")
-			cancelDecode()
+			if decodeStarted.Load() {
+				s.logger.Info("concurrent-dispatch prefill failed after decode started streaming; decode left running",
+					"connector", connector, "status", pw.statusCode)
+			} else {
+				cancelDecode()
+			}
 		}
 		metrics.RecordPrefillDuration(prefillDuration)
 		s.logger.V(logging.DEBUG).Info("concurrent-dispatch prefill request completed", "connector", connector, "status", pw.statusCode)
@@ -134,6 +145,7 @@ func (s *Server) runConcurrentPD(
 
 	decodeReq = decodeReq.WithContext(ctx)
 	decodeWriter, decodeStatus := captureResponseStatus(w)
+	decodeWriter = markFirstBodyWrite(decodeWriter, &decodeStarted)
 	decodeReturned := false
 	defer recordDecodeAbort(&decodeReturned, decodeStart)
 	defer func() {
@@ -189,6 +201,26 @@ func (s *Server) runConcurrentPD(
 			semconv.LLMDPDProxyConcurrentPD(true),
 		)
 	}
+}
+
+// markFirstBodyWrite wraps w so started is set before the first body byte is
+// written. Headers alone do not count: the engine sends them before the KV
+// arrives.
+func markFirstBodyWrite(w http.ResponseWriter, started *atomic.Bool) http.ResponseWriter {
+	return httpsnoop.Wrap(w, httpsnoop.Hooks{
+		Write: func(next httpsnoop.WriteFunc) httpsnoop.WriteFunc {
+			return func(b []byte) (int, error) {
+				started.Store(true)
+				return next(b)
+			}
+		},
+		ReadFrom: func(next httpsnoop.ReadFromFunc) httpsnoop.ReadFromFunc {
+			return func(src io.Reader) (int64, error) {
+				started.Store(true)
+				return next(src)
+			}
+		},
+	})
 }
 
 // recordDecodeAbort records decode duration and a decode error when decode
