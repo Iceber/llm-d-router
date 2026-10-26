@@ -22,6 +22,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 
@@ -88,6 +89,13 @@ func TestReplaceCachedTokens(t *testing.T) {
 			name: "json usage without details",
 			body: `{"usage":{"prompt_tokens":64}}`,
 			want: `{"usage":{"prompt_tokens":64,"prompt_tokens_details":{"cached_tokens":7}}}`,
+		},
+		{
+			// Only usage is decoded: key order and number formatting elsewhere
+			// stay as the worker wrote them.
+			name: "json values outside usage",
+			body: `{"choices":[{"message":{"role":"assistant","content":"hi"},"index":0,"logprobs":{"content":[{"token":"hi","logprob":0.0}]}}],"usage":{"prompt_tokens":64,"prompt_tokens_details":{"cached_tokens":49}}}`,
+			want: `{"choices":[{"message":{"role":"assistant","content":"hi"},"index":0,"logprobs":{"content":[{"token":"hi","logprob":0.0}]}}],"usage":{"prompt_tokens":64,"prompt_tokens_details":{"cached_tokens":7}}}`,
 		},
 		{
 			// Responses reports input_tokens_details; the prompt_tokens_details
@@ -445,5 +453,37 @@ func BenchmarkReplaceCachedTokensSSELineUsageFrame(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		replaceCachedTokensSSELine(benchUsageFrame, 512)
+	}
+}
+
+// A large non-streaming response, written in the 32 KiB chunks
+// httputil.ReverseProxy writes. The two sizes show how the cost scales.
+func BenchmarkResponseWriterChunkedJSON(b *testing.B) {
+	const entry = `{"token":"the","logprob":-0.1234567,"bytes":[116,104,101],"top_logprobs":[{"token":"the","logprob":-0.1234567,"bytes":[116,104,101]},{"token":"a","logprob":-2.5,"bytes":[97]}]}`
+	for _, size := range []struct {
+		name  string
+		bytes int
+	}{{"1MiB", 1 << 20}, {"8MiB", 8 << 20}} {
+		var document bytes.Buffer
+		document.WriteString(`{"choices":[{"index":0,"message":{"role":"assistant","content":"x"},"logprobs":{"content":[`)
+		for document.Len() < size.bytes {
+			document.WriteString(entry + ",")
+		}
+		document.WriteString(entry + `]}}],"usage":{"prompt_tokens":10,"prompt_tokens_details":{"cached_tokens":0}}}`)
+		body := document.Bytes()
+
+		b.Run(size.name, func(b *testing.B) {
+			b.ReportAllocs()
+			b.SetBytes(int64(len(body)))
+			for i := 0; i < b.N; i++ {
+				writer, finalize := NewCachedTokensResponseWriter(httptest.NewRecorder(), 7, false)
+				for chunk := range slices.Chunk(body, 32<<10) {
+					_, _ = writer.Write(chunk)
+				}
+				if err := finalize(); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }

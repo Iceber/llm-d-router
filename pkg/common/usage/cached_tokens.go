@@ -99,27 +99,12 @@ func (r *cachedTokensUsageRewriter) writeHeader(next httpsnoop.WriteHeaderFunc, 
 
 func (r *cachedTokensUsageRewriter) write(next httpsnoop.WriteFunc, body []byte) (int, error) {
 	if !r.streaming {
-		return r.writeJSON(next, body)
-	}
-	updated := r.rewriteSSEChunk(body)
-	if !r.wroteHeader {
-		r.header.Del("Content-Length")
-	}
-	n, err := next(updated)
-	if err != nil {
-		return n, err
-	}
-	return len(body), nil
-}
-
-func (r *cachedTokensUsageRewriter) writeJSON(next httpsnoop.WriteFunc, body []byte) (int, error) {
-	// ReverseProxy may split one JSON document across multiple Write calls.
-	r.jsonBuffer = append(r.jsonBuffer, body...)
-	updated, ok := replaceCachedTokensJSON(r.jsonBuffer, r.cachedTokens)
-	if !ok {
+		// ReverseProxy may split one JSON document across many Write calls; it is
+		// parsed once, by flushJSONBuffer.
+		r.jsonBuffer = append(r.jsonBuffer, body...)
 		return len(body), nil
 	}
-	r.jsonBuffer = nil
+	updated := r.rewriteSSEChunk(body)
 	if !r.wroteHeader {
 		r.header.Del("Content-Length")
 	}
@@ -151,8 +136,8 @@ func (r *cachedTokensUsageRewriter) readFrom(next httpsnoop.WriteFunc, src io.Re
 	if err != nil {
 		return 0, err
 	}
-	_, err = r.write(next, body)
-	if err != nil {
+	r.jsonBuffer = append(r.jsonBuffer, body...)
+	if err := r.flushJSONBuffer(next); err != nil {
 		return 0, err
 	}
 	return int64(len(body)), nil
@@ -268,13 +253,19 @@ func replaceCachedTokens(body []byte, cachedTokens int) []byte {
 }
 
 func replaceCachedTokensJSON(body []byte, cachedTokens int) ([]byte, bool) {
-	var response map[string]any
+	var response map[string]json.RawMessage
 	if err := json.Unmarshal(body, &response); err != nil {
 		return nil, false
 	}
-	if !setCachedTokens(response, cachedTokens) {
+	var block map[string]any
+	if err := json.Unmarshal(response[reqcommon.FieldUsage], &block); err != nil || !setCachedTokens(block, cachedTokens) {
 		return body, true
 	}
+	usage, err := json.Marshal(block)
+	if err != nil {
+		return body, true
+	}
+	response[reqcommon.FieldUsage] = usage
 	updated, err := json.Marshal(response)
 	if err != nil {
 		return body, true
@@ -339,9 +330,8 @@ func replaceCachedTokensSSELine(line []byte, cachedTokens int) ([]byte, bool) {
 	return updated, true
 }
 
-func setCachedTokens(response map[string]any, cachedTokens int) bool {
-	block, ok := response[reqcommon.FieldUsage].(map[string]any)
-	if !ok {
+func setCachedTokens(block map[string]any, cachedTokens int) bool {
+	if block == nil {
 		return false
 	}
 	details, ok := tokenDetails(block)
