@@ -171,6 +171,7 @@ func TestRepackagePreservesNativeRenderContent(t *testing.T) {
 		{"/v1/completions/render", `"prompt":[1,2,3]`, openai.NewOpenAIParser()},
 		{"/v1/messages/render", `"messages":[{"role":"user","content":"hi"}]`, anthropic.NewAnthropicParser()},
 		{"/v1/systemone", `"state":{"b":2,"a":1},"questions":{"q":{"type":"noul","instructions":"hi"}}`, systemone.NewSystemOneParser()},
+		{"/v1/decisions", `"input":[{"role":"user","content":"hi"}],"questions":[{"type":"predicate","instructions":"hi"}]`, openai.NewOpenAIParser()},
 	} {
 		for _, rewrite := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/rewrite=%t", tt.path, rewrite), func(t *testing.T) {
@@ -641,6 +642,34 @@ func TestDirector_HandleRequest(t *testing.T) {
 				m.scheduleResults = defaultSuccessfulScheduleResults
 			},
 			initialTargetModelName: model,
+			wantReqCtx: &handlers.RequestContext{
+				ObjectiveKey:    objectiveName,
+				TargetModelName: model,
+				TargetPod: &fwkdl.EndpointMetadata{
+					ID:          types.NamespacedName{Namespace: "default", Name: "pod1"},
+					Address:     "192.168.1.100",
+					Port:        "8000",
+					MetricsHost: "192.168.1.100:8000",
+				},
+				TargetEndpoint: "192.168.1.100:8000,192.168.2.100:8000,192.168.4.100:8000",
+			},
+			wantRawBodyUnchanged:   true,
+			inferenceObjectiveName: objectiveName,
+		},
+		{
+			name: "decisions request is forwarded unchanged with priority propagation",
+			reqBodyMap: map[string]any{
+				"model":     model,
+				"input":     "evidence",
+				"questions": []any{map[string]any{"type": "predicate", "instructions": "True?"}},
+			},
+			mockAdmissionController: &mockAdmissionController{admitErr: nil},
+			schedulerMockSetup: func(m *mockScheduler) {
+				m.scheduleResults = defaultSuccessfulScheduleResults
+			},
+			initialTargetModelName: model,
+			parser:                 newOpenAIParserWithPriorityPropagation(t),
+			propagatePriority:      true,
 			wantReqCtx: &handlers.RequestContext{
 				ObjectiveKey:    objectiveName,
 				TargetModelName: model,
@@ -1534,6 +1563,8 @@ func TestDirector_HandleRequest(t *testing.T) {
 					reqCtx.Request.Headers[":path"] = "/v1/completions"
 				} else if _, hasMessages := test.reqBodyMap["messages"]; hasMessages {
 					reqCtx.Request.Headers[":path"] = "/v1/chat/completions"
+				} else if _, hasQuestions := test.reqBodyMap["questions"]; hasQuestions {
+					reqCtx.Request.Headers[":path"] = "/v1/decisions"
 				}
 
 				if test.fairnessIDHeader != "" {

@@ -47,6 +47,7 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/epp/datastore"
 	"github.com/llm-d/llm-d-router/pkg/epp/flowcontrol/contracts"
 	"github.com/llm-d/llm-d-router/pkg/epp/flowcontrol/eviction"
+	fwkrequest "github.com/llm-d/llm-d-router/pkg/epp/framework/common/request"
 	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 	fwkrc "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
@@ -401,7 +402,10 @@ func (d *Director) priorityRewriteIfNeeded(ctx context.Context, reqCtx *handlers
 		logger.V(logutil.DEBUG).Info("payload does not implement MarshalablePayload, skipping priority rewrite")
 		return nil
 	}
-	mutatedPayload, mutated, err := rewriter.RewritePriority(fwkrh.PriorityRewriteContext{TargetEndpoint: reqCtx.TargetPod}, payload, reqCtx.Priority)
+	mutatedPayload, mutated, err := rewriter.RewritePriority(fwkrh.PriorityRewriteContext{
+		TargetEndpoint: reqCtx.TargetPod,
+		RequestPath:    fwkrequest.GetRequestPath(reqCtx.Request.Headers),
+	}, payload, reqCtx.Priority)
 	if err != nil {
 		return err
 	}

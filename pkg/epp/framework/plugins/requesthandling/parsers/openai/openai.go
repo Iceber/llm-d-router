@@ -54,6 +54,7 @@ const (
 	// Requests are multipart/form-data.
 	imagesEditsAPI = "images/edits"
 	audioSpeechAPI = "audio/speech"
+	decisionsAPI   = request.DecisionsPathSuffix
 
 	octetStreamType = "application/octet-stream"
 
@@ -105,6 +106,7 @@ func (p *OpenAIParser) Claims() fwkrh.Claims {
 			imagesGenerationsAPI,
 			imagesEditsAPI,
 			audioSpeechAPI,
+			decisionsAPI,
 		},
 		Protocols: []v1.AppProtocol{v1.AppProtocolH2C, v1.AppProtocolHTTP},
 	}
@@ -128,6 +130,9 @@ func (p *OpenAIParser) ParseRequest(ctx context.Context, body []byte, headers ma
 	apiType := determineAPITypeFromPath(path)
 	if apiType == imagesEditsAPI {
 		return parseImagesEditsRequest(body, headers)
+	}
+	if apiType == decisionsAPI {
+		return parseDecisionsRequest(body)
 	}
 	extractedBody, err := extractRequestBody(apiType, body)
 	if err != nil {
@@ -204,7 +209,11 @@ func (p *OpenAIParser) RewriteModelName(payload fwkrh.MarshalablePayload, model 
 // OpenAI-compatible request payload and writes the resolved EPP priority. The
 // director only calls this when priority propagation is enabled; see
 // parsers.RewritePriority for the cross-backend priority semantics.
+// Decisions requests are left unchanged: the Decisions schema declares no priority and rejects unknown fields.
 func (p *OpenAIParser) RewritePriority(ctx fwkrh.PriorityRewriteContext, payload fwkrh.MarshalablePayload, priority int) (fwkrh.MarshalablePayload, bool, error) {
+	if determineAPITypeFromPath(ctx.RequestPath) == decisionsAPI {
+		return payload, false, nil
+	}
 	return parsers.RewritePriority(ctx, payload, priority)
 }
 
@@ -353,6 +362,9 @@ func determineAPITypeFromPath(path string) string {
 	if request.MatchPathSuffix(path, "/audio/speech") {
 		return audioSpeechAPI
 	}
+	if request.MatchPathSuffix(path, decisionsAPI) {
+		return decisionsAPI
+	}
 
 	// Default to completions API for backward compatibility with existing clients and integration tests
 	return completionsAPI
@@ -445,6 +457,28 @@ func extractRequestBody(apiType string, rawBody []byte) (*fwkrh.InferenceRequest
 	default:
 		return nil, errors.New("unsupported API endpoint")
 	}
+}
+
+// parseDecisionsRequest reads the routing envelope of a /v1/decisions request.
+func parseDecisionsRequest(body []byte) (*fwkrh.ParseResult, error) {
+	bodyMap, err := parserutil.UnmarshalEnvelope(body, reqcommon.FieldInput)
+	if err != nil {
+		return nil, fmt.Errorf("error unmarshaling request body: %w", err)
+	}
+	questions, ok := bodyMap["questions"].(json.RawMessage)
+	if !ok || len(questions) == 0 || questions[0] != '[' {
+		return nil, errors.New("invalid decisions request: questions must be a JSON array")
+	}
+	result := &fwkrh.InferenceRequestBody{
+		Payload: fwkrh.PayloadMap(bodyMap),
+		RawBody: body,
+		// The engine renders one prompt per question, which the router cannot reproduce.
+		RenderRequest: true,
+	}
+	if model, ok := bodyMap["model"].(string); ok {
+		result.Model = model
+	}
+	return &fwkrh.ParseResult{Body: result, JSONValidated: true, SkipResponseProcessing: false}, nil
 }
 
 // parseImagesEditsRequest parses a multipart/form-data /v1/images/edits request.

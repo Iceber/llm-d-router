@@ -149,6 +149,13 @@ func TestOpenAIParser_RewritePriority(t *testing.T) {
 			want:        map[string]any{"model": "test", "priority": 2},
 			wantMutated: true,
 		},
+		{
+			name:        "leaves decisions request unchanged",
+			payload:     fwkrh.PayloadMap{"model": "test", "priority": 100},
+			ctx:         fwkrh.PriorityRewriteContext{RequestPath: "/v1/decisions"},
+			want:        map[string]any{"model": "test", "priority": 100},
+			wantMutated: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -2092,6 +2099,7 @@ func TestOpenAIParser_Claims(t *testing.T) {
 			imagesGenerationsAPI,
 			imagesEditsAPI,
 			audioSpeechAPI,
+			decisionsAPI,
 		},
 		Protocols: []v1.AppProtocol{v1.AppProtocolH2C, v1.AppProtocolHTTP},
 	}
@@ -2317,5 +2325,108 @@ func TestOpenAIParser_ParseRequest_MaxOutputTokens(t *testing.T) {
 				t.Errorf("MaxOutputTokens mismatch (-want +got):\n%s", diff)
 			}
 		})
+	}
+}
+
+// A request with message-array input, ordered questions, and extra top-level fields.
+const decisionsRequest = `{"model":"Qwen/Qwen3-0.6B",` +
+	`"input":[{"role":"user","content":[{"type":"input_text","text":"Charged twice"}]}],` +
+	`"questions":[{"type":"predicate","name":"urgent","instructions":"Is it urgent?"},` +
+	`{"type":"choice","name":"team","instructions":"Which team?","choices":[{"value":"billing"},{"value":true}]},` +
+	`{"type":"score","name":"tone","instructions":"How upset?","levels":[{"label":"calm"},{"label":"furious"}]}],` +
+	`"safety_identifier":"user-9007199254740993","cache_salt":"tenant-a"}`
+
+var decisionsHeaders = map[string]string{":path": "/v1/decisions"}
+
+func TestOpenAIParser_ParseDecisionsRequest(t *testing.T) {
+	result, err := NewOpenAIParser().ParseRequest(context.Background(), []byte(decisionsRequest), decisionsHeaders)
+	if err != nil {
+		t.Fatalf("ParseRequest() error = %v", err)
+	}
+	if result.SkipResponseProcessing || !result.JSONValidated {
+		t.Errorf("SkipResponseProcessing = %v, JSONValidated = %v, want false, true", result.SkipResponseProcessing, result.JSONValidated)
+	}
+	body := result.Body
+	if body.Model != "Qwen/Qwen3-0.6B" || !body.RenderRequest {
+		t.Errorf("body = {Model:%q RenderRequest:%v}, want model set and render request", body.Model, body.RenderRequest)
+	}
+	if !bytes.Equal(body.RawBody, []byte(decisionsRequest)) {
+		t.Errorf("RawBody = %s, want the request bytes", body.RawBody)
+	}
+}
+
+func TestOpenAIParser_ParseDecisionsRequest_StringInput(t *testing.T) {
+	body := `{"model":"m","input":"Charged \"twice\"","questions":[{"type":"predicate","instructions":"q"}]}`
+	result, err := NewOpenAIParser().ParseRequest(context.Background(), []byte(body), decisionsHeaders)
+	if err != nil {
+		t.Fatalf("ParseRequest() error = %v", err)
+	}
+	if got := string(result.Body.Payload.(fwkrh.PayloadMap)[reqcommon.FieldInput].(json.RawMessage)); got != `"Charged \"twice\""` {
+		t.Errorf("input = %s, want it kept opaque", got)
+	}
+}
+
+func TestOpenAIParser_ParseDecisionsRequest_Errors(t *testing.T) {
+	for name, body := range map[string]string{
+		"invalid json":        `{"model":`,
+		"missing questions":   `{"model":"m","input":"s"}`,
+		"questions as object": `{"model":"m","input":"s","questions":{"q":{"type":"predicate"}}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := NewOpenAIParser().ParseRequest(context.Background(), []byte(body), decisionsHeaders); err == nil {
+				t.Error("ParseRequest() error = nil, want an error")
+			}
+		})
+	}
+}
+
+// The forwarded body keeps every field byte for byte when the router rewrites the model.
+func TestOpenAIParser_DecisionsRewriteModelNameRoundTrip(t *testing.T) {
+	parser := NewOpenAIParser()
+	result, err := parser.ParseRequest(context.Background(), []byte(decisionsRequest), decisionsHeaders)
+	if err != nil {
+		t.Fatalf("ParseRequest() error = %v", err)
+	}
+	rewritten, err := parser.RewriteModelName(result.Body.Payload.(fwkrh.MarshalablePayload), "served-model")
+	if err != nil {
+		t.Fatalf("RewriteModelName() error = %v", err)
+	}
+	out, err := rewritten.(fwkrh.Marshaler).Marshal()
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	var got, want map[string]json.RawMessage
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal([]byte(decisionsRequest), &want); err != nil {
+		t.Fatal(err)
+	}
+	if string(got["model"]) != `"served-model"` {
+		t.Errorf("model = %s, want \"served-model\"", got["model"])
+	}
+	delete(got, "model")
+	delete(want, "model")
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("forwarded fields mismatch (-want +got):\n%s", diff)
+	}
+}
+
+func TestOpenAIParser_ParseDecisionsResponse(t *testing.T) {
+	body := `{"model":"m","answers":[{"type":"predicate","name":"urgent","probability":0.1}],` +
+		`"usage":{"input_tokens":254,"input_tokens_details":{"cached_tokens":200,"cache_write_tokens":0},` +
+		`"output_tokens":3,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":257}}`
+	got, err := NewOpenAIParser().ParseResponse(context.Background(), []byte(body), map[string]string{"content-type": "application/json"}, true)
+	if err != nil {
+		t.Fatalf("ParseResponse() error = %v", err)
+	}
+	want := &fwkrh.Usage{
+		PromptTokens:       254,
+		CompletionTokens:   3,
+		TotalTokens:        257,
+		PromptTokenDetails: &fwkrh.PromptTokenDetails{CachedTokens: 200},
+	}
+	if diff := cmp.Diff(want, got.Usage); diff != "" {
+		t.Errorf("Usage mismatch (-want +got):\n%s", diff)
 	}
 }
