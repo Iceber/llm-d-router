@@ -2099,7 +2099,7 @@ func TestOpenAIParser_Claims(t *testing.T) {
 			imagesGenerationsAPI,
 			imagesEditsAPI,
 			audioSpeechAPI,
-			decisionsAPI,
+			request.DecisionsPathSuffix,
 		},
 		Protocols: []v1.AppProtocol{v1.AppProtocolH2C, v1.AppProtocolHTTP},
 	}

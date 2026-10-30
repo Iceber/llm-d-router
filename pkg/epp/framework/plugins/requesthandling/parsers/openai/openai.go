@@ -54,7 +54,6 @@ const (
 	// Requests are multipart/form-data.
 	imagesEditsAPI = "images/edits"
 	audioSpeechAPI = "audio/speech"
-	decisionsAPI   = request.DecisionsPathSuffix
 
 	octetStreamType = "application/octet-stream"
 
@@ -106,7 +105,7 @@ func (p *OpenAIParser) Claims() fwkrh.Claims {
 			imagesGenerationsAPI,
 			imagesEditsAPI,
 			audioSpeechAPI,
-			decisionsAPI,
+			request.DecisionsPathSuffix,
 		},
 		Protocols: []v1.AppProtocol{v1.AppProtocolH2C, v1.AppProtocolHTTP},
 	}
@@ -131,7 +130,7 @@ func (p *OpenAIParser) ParseRequest(ctx context.Context, body []byte, headers ma
 	if apiType == imagesEditsAPI {
 		return parseImagesEditsRequest(body, headers)
 	}
-	if apiType == decisionsAPI {
+	if apiType == request.DecisionsPathSuffix {
 		return parseDecisionsRequest(body)
 	}
 	extractedBody, err := extractRequestBody(apiType, body)
@@ -211,7 +210,7 @@ func (p *OpenAIParser) RewriteModelName(payload fwkrh.MarshalablePayload, model 
 // parsers.RewritePriority for the cross-backend priority semantics.
 // Decisions requests are left unchanged: the Decisions schema declares no priority and rejects unknown fields.
 func (p *OpenAIParser) RewritePriority(ctx fwkrh.PriorityRewriteContext, payload fwkrh.MarshalablePayload, priority int) (fwkrh.MarshalablePayload, bool, error) {
-	if determineAPITypeFromPath(ctx.RequestPath) == decisionsAPI {
+	if determineAPITypeFromPath(ctx.RequestPath) == request.DecisionsPathSuffix {
 		return payload, false, nil
 	}
 	return parsers.RewritePriority(ctx, payload, priority)
@@ -362,8 +361,8 @@ func determineAPITypeFromPath(path string) string {
 	if request.MatchPathSuffix(path, "/audio/speech") {
 		return audioSpeechAPI
 	}
-	if request.MatchPathSuffix(path, decisionsAPI) {
-		return decisionsAPI
+	if request.MatchPathSuffix(path, request.DecisionsPathSuffix) {
+		return request.DecisionsPathSuffix
 	}
 
 	// Default to completions API for backward compatibility with existing clients and integration tests
