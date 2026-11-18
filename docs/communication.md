@@ -56,7 +56,7 @@ Client Request (/v1/chat/completions, /v1/responses, /v1/messages, /v1/completio
     |--- /inference/v1/generate --> skip encode (prefill encodes inline from kwargs_data), go to [prefill]
     |
     v
-[encode] - Fan-out: one request per media entry, runs the encoder
+[encode] - Fan-out: one request per distinct media entry, runs the encoder
     |
     v
 [prefill] - Single request with encoder outputs; full token sequence too, in the generate format
@@ -605,7 +605,7 @@ Like chat completions, the body is sent unchanged:
 
 ## Stage 4: encode (fan-out, one per media entry)
 
-Sends one encode request per multimodal entry, whatever its modality. Each carries only the BOS token plus that entry's placeholder tokens, with `mm_hashes` and `kwargs_data` keyed under the entry's own modality. On the chat-completions path it also carries the one matching content part, located by counting parts of that modality. The encoder runs and stores the result in the EC (Embedding Cache).
+Sends one encode request per distinct multimodal entry, whatever its modality: entries that share a render hash (the same media referenced more than once) share one request, since the encoder stores one embedding per hash; without a render step, entries with identical request bodies share one. Each request carries only the BOS token plus that entry's placeholder tokens, with `mm_hashes` and `kwargs_data` keyed under the entry's own modality. On the chat-completions path it also carries the one matching content part, located by counting parts of that modality. The encoder runs and stores the result in the EC (Embedding Cache).
 
 **Skipped for `/v1/completions` requests** (completions cannot contain multimedia content).
 

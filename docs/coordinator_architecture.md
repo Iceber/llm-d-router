@@ -141,7 +141,7 @@ encode or prefill at all: if the chosen decode pod already has what it needs (e.
 prompt is already cached), it serves the request directly and the full pipeline never
 runs. Only if decode responds `412 Precondition Failed` does the Coordinator fall back
 to the full `encode → prefill → decode` cascade — which is also how a request with
-multiple multimedia entries fans encode out in parallel, one call per entry.
+multiple multimedia entries fans encode out in parallel, one call per distinct entry.
 
 ```mermaid
 sequenceDiagram
@@ -921,7 +921,7 @@ upstream gRPC methods regardless of `worker_protocol`.
 | `replace-media-urls` | Download `image_url`, `audio_url`, and `video_url` references (chat completions) or `input_image` references (Responses) and accept inline `input_audio`, inline each as a base64 `data:` URI, seed one `MultimodalEntries` item per part tagged with its modality. | `download_timeout`, `max_concurrent_downloads`, `max_multimodal_entries`, `max_download_size`, `max_image_download_size`, `max_audio_download_size`, `max_video_download_size`, `allowed_image_content_types`, `allowed_audio_content_types`, `allowed_video_content_types`, `allow_private_networks`, `allowed_domains` |
 | `render` | Tokenize via the render service; populate `TokenIDs` and each entry's hash/placeholder/kwargs from the per-modality `mm_hashes` / `mm_placeholders` / `kwargs_data` maps. | `address` (required), `timeout`, `max_total_tokens`, `max_total_placeholder_tokens`, `mm_payload` |
 | `conditional-decode` | Optional fast path: attempt decode with `Prefer: if-available`; on 412 continue, otherwise stream the response and stop. A served hit runs the same prompt-token parity check as `decode`. Optionally sends the rendered token IDs, as on `decode` (`forward_prompt_token_ids`). | `prompt_token_parity`, `forward_prompt_token_ids` |
-| `encode` | Parallel fan-out, one request per multimodal entry; merge EC descriptors. | `max_parallel`, `use_openai_format`, `ec_connector` |
+| `encode` | Parallel fan-out, one request per distinct multimodal entry; merge EC descriptors. | `max_parallel`, `use_openai_format`, `ec_connector` |
 | `prefill` | Single prefill call with tokens + EC/KV hints; capture `kv_transfer_params`. | `use_openai_format`, `kv_connector`, `ec_connector` |
 | `decode` | Stream the final completion to the client. Checks that the worker's prompt token count matches the rendered one (`prompt_token_parity`). Optionally sends the rendered token IDs in `kv_transfer_params.prompt_token_ids` so the worker skips tokenization (`forward_prompt_token_ids`). | `kv_connector`, `prompt_token_parity`, `forward_prompt_token_ids` |
 

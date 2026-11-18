@@ -20,17 +20,20 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	reqcommon "github.com/llm-d/llm-d-router/pkg/common/request"
 	"github.com/llm-d/llm-d-router/pkg/common/routing"
 	"github.com/llm-d/llm-d-router/pkg/common/usage"
 	"github.com/llm-d/llm-d-router/pkg/coordinator/config"
+	"github.com/llm-d/llm-d-router/pkg/coordinator/connectors/ec"
 	"github.com/llm-d/llm-d-router/pkg/coordinator/connectors/kv"
 	"github.com/llm-d/llm-d-router/pkg/coordinator/gateway"
 	"github.com/llm-d/llm-d-router/pkg/coordinator/pipeline"
@@ -86,6 +89,103 @@ func TestECTransferParams_NotForwardedToDecodeBackend(t *testing.T) {
 	}
 	if _, present := decodeBody["ec_transfer_params"]; present {
 		t.Errorf("ec_transfer_params must not be forwarded to the decode backend, got: %v", decodeBody["ec_transfer_params"])
+	}
+}
+
+// TestDuplicateImage_FlowFromEncodeToDecode runs a chat request referencing one
+// image twice through encode, prefill and decode with ec-nixl. The gateway
+// answers each encode request from a different peer, so a second encode of the
+// same hash would fail the prefill merge. The image is encoded once, prefill
+// gets one descriptor, and decode stamps both parts with the hash.
+func TestDuplicateImage_FlowFromEncodeToDecode(t *testing.T) {
+	const imageHash = "hash-cat"
+	const image = "data:image/jpeg;base64,Y2F0"
+
+	var encodeCount atomic.Int32
+	var prefillBody, decodeBody map[string]any
+	gwServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		switch r.Header.Get(reqcommon.EPPProfileHeaderKey) {
+		case gateway.PhaseEncode:
+			n := encodeCount.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"ec_transfer_params": map[string]any{
+					imageHash: map[string]any{"peer_host": fmt.Sprintf("10.0.0.%d", n), "peer_port": 5501},
+				},
+			})
+		case gateway.PhasePrefill:
+			_ = json.Unmarshal(raw, &prefillBody)
+			_ = json.NewEncoder(w).Encode(map[string]any{"kv_transfer_params": map[string]any{"remote_block_ids": []int{1}}})
+		case gateway.PhaseDecode:
+			_ = json.Unmarshal(raw, &decodeBody)
+			_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": map[string]any{"content": "a cat"}}}})
+		}
+	}))
+	defer gwServer.Close()
+
+	gwClient := gateway.New(config.GatewayConfig{Address: gwServer.URL})
+	params := map[string]any{ParamECConnector: ec.NIXL, ParamKVConnector: kv.NIXL}
+	encodeStep, err := NewEncodeStep(gwClient, params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prefillStep, err := NewPrefillStep(gwClient, params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decodeStep, err := NewDecodeStep(gwClient, map[string]any{ParamKVConnector: kv.NIXL, ParamPromptTokenParity: promptTokenParityOff})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reqCtx := &pipeline.RequestContext{
+		RequestID:    "req-dup-flow",
+		OriginalPath: reqcommon.PathChatCompletions,
+		Model:        "llama-3",
+		TokenIDs:     []int{1, 32000, 5, 32000, 2345},
+		Body: map[string]any{
+			"model": "llama-3",
+			"messages": []any{
+				map[string]any{"role": "user", "content": []any{
+					map[string]any{"type": reqcommon.PartTypeImageURL, reqcommon.FieldImageURL: map[string]any{"url": image}},
+				}},
+				map[string]any{"role": "assistant", "content": "a cat"},
+				map[string]any{"role": "user", "content": []any{
+					map[string]any{"type": "text", "text": "what color?"},
+					map[string]any{"type": reqcommon.PartTypeImageURL, reqcommon.FieldImageURL: map[string]any{"url": image}},
+				}},
+			},
+		},
+		MultimodalEntries: []pipeline.MultimodalEntry{
+			{Modality: reqcommon.ModalityImage, Hash: imageHash, Placeholder: pipeline.PlaceholderRange{Offset: 1, Length: 1}},
+			{Modality: reqcommon.ModalityImage, Hash: imageHash, Placeholder: pipeline.PlaceholderRange{Offset: 3, Length: 1}},
+		},
+		KVTransferParams: make(map[string]any),
+		ResponseWriter:   httptest.NewRecorder(),
+	}
+
+	p := pipeline.New([]pipeline.Step{encodeStep, prefillStep, decodeStep})
+	if err := p.Execute(context.Background(), reqCtx); err != nil {
+		t.Fatalf("pipeline failed: %v", err)
+	}
+
+	if got := encodeCount.Load(); got != 1 {
+		t.Errorf("image encoded %d times, want once", got)
+	}
+	ecParams, _ := prefillBody["ec_transfer_params"].(map[string]any)
+	if len(ecParams) != 1 || ecParams[imageHash] == nil {
+		t.Errorf("prefill ec_transfer_params = %v, want one descriptor under %q", prefillBody["ec_transfer_params"], imageHash)
+	}
+	messages, _ := decodeBody["messages"].([]any)
+	if len(messages) != 3 {
+		t.Fatalf("decode body messages = %v", decodeBody["messages"])
+	}
+	for _, msgIdx := range []int{0, 2} {
+		content, _ := messages[msgIdx].(map[string]any)["content"].([]any)
+		part, _ := content[len(content)-1].(map[string]any)
+		if part[reqcommon.FieldUUID] != imageHash {
+			t.Errorf("message %d image uuid = %v, want %q", msgIdx, part[reqcommon.FieldUUID], imageHash)
+		}
 	}
 }
 

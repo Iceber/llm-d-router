@@ -18,6 +18,7 @@ package steps
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -102,11 +103,6 @@ func (s *EncodeStep) Execute(ctx context.Context, reqCtx *pipeline.RequestContex
 		return nil
 	}
 
-	reqCtx.EncodeFanout = len(reqCtx.MultimodalEntries)
-
-	results := make([]map[string]any, len(reqCtx.MultimodalEntries))
-	responseHeaders := make([]http.Header, len(reqCtx.MultimodalEntries))
-
 	format := resolveFormat(s.useOpenAIFormat, reqCtx.OriginalPath)
 	var partsByMod map[reqcommon.Modality][]mediaPart
 	if format != reqcommon.APITypeVLLMGenerate || reqCtx.MMPayload != "" {
@@ -138,13 +134,26 @@ func (s *EncodeStep) Execute(ctx context.Context, reqCtx *pipeline.RequestContex
 		bodies[i] = body
 	}
 
+	unique, err := uniqueEncodeIndexes(reqCtx.MultimodalEntries, bodies)
+	if err != nil {
+		return err
+	}
+	if len(unique) < len(bodies) {
+		logger.V(logutil.DEBUG).Info("deduplicated encode sub-requests",
+			"entries", len(bodies), "sub_requests", len(unique))
+	}
+	reqCtx.EncodeFanout = len(unique)
+
+	results := make([]map[string]any, len(unique))
+	responseHeaders := make([]http.Header, len(unique))
+
 	g, gCtx := errgroup.WithContext(ctx)
 	g.SetLimit(s.maxParallel)
-	for i := range reqCtx.MultimodalEntries {
+	for slot, i := range unique {
 		g.Go(func() error {
 			result, headers, err := s.executeOne(gCtx, logger, reqCtx, i, bodies[i], format)
-			results[i] = result
-			responseHeaders[i] = headers
+			results[slot] = result
+			responseHeaders[slot] = headers
 			return err
 		})
 	}
@@ -162,6 +171,34 @@ func (s *EncodeStep) Execute(ctx context.Context, reqCtx *pipeline.RequestContex
 
 	logger.V(logutil.DEFAULT).Info("all sub-requests complete", "count", len(results))
 	return nil
+}
+
+// uniqueEncodeIndexes returns the index of the first entry for each distinct
+// piece of encoder work, in entry order. The encoder stores one embedding per
+// mm_hash, so a media item referenced twice needs one sub-request: a second one
+// can land on another encoder pod, whose descriptor for the same hash the
+// ec-nixl merge rejects as a conflict. The render hash names the work; without
+// a render step the sub-request body stands in.
+func uniqueEncodeIndexes(entries []pipeline.MultimodalEntry, bodies []map[string]any) ([]int, error) {
+	seen := make(map[string]struct{}, len(entries))
+	unique := make([]int, 0, len(entries))
+	for i, entry := range entries {
+		key := entry.Hash
+		if key == "" {
+			raw, err := json.Marshal(bodies[i])
+			if err != nil {
+				return nil, fmt.Errorf("encode[%d]: marshal: %w", i, err)
+			}
+			sum := sha256.Sum256(raw)
+			key = string(sum[:])
+		}
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		unique = append(unique, i)
+	}
+	return unique, nil
 }
 
 func (s *EncodeStep) executeOne(

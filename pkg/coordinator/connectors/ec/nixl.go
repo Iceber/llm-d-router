@@ -77,10 +77,12 @@ func (nixlEC) PreparePrefillECParams(ctx context.Context, reqCtx *pipeline.Reque
 			}
 			copied := copyDescriptor(desc)
 			if existing, exists := params[k]; exists {
-				// Two encoder replicas answered for the same mm_hash. Identical
-				// descriptors are harmless; conflicting ones are not. Picking
-				// one (last-write-wins) would point the prefill pull at a peer
-				// that may have rotated its buffers, so reject the request.
+				// The encode step sends one sub-request per mm_hash, so a second
+				// answer for a hash means an encoder keyed its response under
+				// another entry's hash. Identical descriptors are harmless;
+				// conflicting ones are not. Picking one (last-write-wins) would
+				// point the prefill pull at a peer that may have rotated its
+				// buffers, so reject the request.
 				if !reflect.DeepEqual(existing, copied) {
 					return nil, fmt.Errorf("ec_transfer_params: conflicting descriptors for mm_hash %q across encoder responses", k)
 				}

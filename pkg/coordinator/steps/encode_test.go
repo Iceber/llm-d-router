@@ -2109,3 +2109,111 @@ func TestEncodeStep_SkipsSGLangGRPCGenerate(t *testing.T) {
 		t.Fatalf("encode sent %d gateway requests for a gRPC Generate request, want 0", got)
 	}
 }
+
+// TestEncodeStep_DuplicateHashSendsOneSubRequest verifies that entries sharing
+// a render hash (the same image referenced twice) produce one encode
+// sub-request and one merged ec_transfer_params entry. Entry order is A, B, A:
+// the duplicate is non-adjacent so position cannot stand in for identity.
+func TestEncodeStep_DuplicateHashSendsOneSubRequest(t *testing.T) {
+	var mu sync.Mutex
+	var sentHashes []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var parsed map[string]any
+		_ = json.Unmarshal(body, &parsed)
+		features, _ := parsed["features"].(map[string]any)
+		mmHashes, _ := features["mm_hashes"].(map[string]any)
+		imageHashes, _ := mmHashes[string(reqcommon.ModalityImage)].([]any)
+		hash, _ := imageHashes[0].(string)
+		mu.Lock()
+		sentHashes = append(sentHashes, hash)
+		mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ec_transfer_params": map[string]any{hash: map[string]any{"peer_host": "10.0.0.1", "peer_port": 5501}},
+		})
+	}))
+	defer server.Close()
+
+	step, err := NewEncodeStep(gateway.New(config.GatewayConfig{Address: server.URL}), map[string]any{
+		"use_openai_format": false,
+		"max_parallel":      1,
+		ParamECConnector:    ec.NIXL,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reqCtx := &pipeline.RequestContext{
+		RequestID: "req-dup",
+		Model:     testModelName,
+		TokenIDs:  []int{1, 32000, 32000, 32000, 2345},
+		MultimodalEntries: []pipeline.MultimodalEntry{
+			{Modality: reqcommon.ModalityImage, Hash: "hash-a", KwargsData: "dGVuc29yLWE=", Placeholder: pipeline.PlaceholderRange{Offset: 1, Length: 1}},
+			{Modality: reqcommon.ModalityImage, Hash: "hash-b", KwargsData: "dGVuc29yLWI=", Placeholder: pipeline.PlaceholderRange{Offset: 2, Length: 1}},
+			{Modality: reqcommon.ModalityImage, Hash: "hash-a", KwargsData: "dGVuc29yLWE=", Placeholder: pipeline.PlaceholderRange{Offset: 3, Length: 1}},
+		},
+	}
+	if err := step.Execute(context.Background(), reqCtx); err != nil {
+		t.Fatalf("encode failed: %v", err)
+	}
+
+	if !reflect.DeepEqual(sentHashes, []string{"hash-a", "hash-b"}) {
+		t.Errorf("sub-requests sent for %v, want one per unique hash in first-seen order", sentHashes)
+	}
+	if reqCtx.EncodeFanout != 2 {
+		t.Errorf("EncodeFanout = %d, want the number of sub-requests sent", reqCtx.EncodeFanout)
+	}
+	if len(reqCtx.ECTransferParams) != 2 {
+		t.Errorf("expected one ec_transfer_params entry per unique hash, got %v", reqCtx.ECTransferParams)
+	}
+}
+
+// TestEncodeStep_DuplicateMediaWithoutHashSendsOneSubRequest covers a pipeline
+// without a render step: the entries carry no hash, so identical sub-request
+// bodies identify the same encoder work.
+func TestEncodeStep_DuplicateMediaWithoutHashSendsOneSubRequest(t *testing.T) {
+	var requestCount atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requestCount.Add(1)
+		_ = json.NewEncoder(w).Encode(map[string]any{"ec_transfer_params": map[string]any{}})
+	}))
+	defer server.Close()
+
+	step, err := NewEncodeStep(gateway.New(config.GatewayConfig{Address: server.URL}), map[string]any{
+		ParamECConnector: ec.NIXL,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const sameImage = "data:image/jpeg;base64,SAME"
+	reqCtx := &pipeline.RequestContext{
+		RequestID:    "req-dup-nohash",
+		OriginalPath: reqcommon.PathChatCompletions,
+		Model:        testModelName,
+		Body: map[string]any{
+			"model": testModelName,
+			"messages": []any{
+				map[string]any{"role": "user", "content": []any{
+					map[string]any{"type": reqcommon.PartTypeImageURL, reqcommon.FieldImageURL: map[string]any{"url": sameImage}},
+					map[string]any{"type": reqcommon.PartTypeImageURL, reqcommon.FieldImageURL: map[string]any{"url": "data:image/jpeg;base64,OTHER"}},
+				}},
+				map[string]any{"role": "user", "content": []any{
+					map[string]any{"type": reqcommon.PartTypeImageURL, reqcommon.FieldImageURL: map[string]any{"url": sameImage}},
+				}},
+			},
+		},
+		MultimodalEntries: []pipeline.MultimodalEntry{
+			{Modality: reqcommon.ModalityImage},
+			{Modality: reqcommon.ModalityImage},
+			{Modality: reqcommon.ModalityImage},
+		},
+	}
+	if err := step.Execute(context.Background(), reqCtx); err != nil {
+		t.Fatalf("encode failed: %v", err)
+	}
+	if got := requestCount.Load(); got != 2 {
+		t.Fatalf("encode sent %d gateway requests for 2 distinct images, want 2", got)
+	}
+	if reqCtx.EncodeFanout != 2 {
+		t.Errorf("EncodeFanout = %d, want 2", reqCtx.EncodeFanout)
+	}
+}

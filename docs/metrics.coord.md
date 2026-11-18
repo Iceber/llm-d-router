@@ -125,7 +125,7 @@ Recorded by every step that calls out: render to the renderer service, replace-m
 
 | Name | Type | Notes |
 |---|---|---|
-| `upstream_request_total` | Counter | Outbound calls, one per call (encode contributes one per image, replace-media-urls one per URL). |
+| `upstream_request_total` | Counter | Outbound calls, one per call (encode contributes one per distinct image, replace-media-urls one per URL). |
 | `upstream_request_duration_seconds` | Histogram | Latency of one call; `GeneralLatencyBuckets` (5 ms to 1 h). |
 
 **Key details:**

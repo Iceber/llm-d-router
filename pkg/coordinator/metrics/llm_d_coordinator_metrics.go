@@ -231,7 +231,7 @@ var (
 		prometheus.HistogramOpts{
 			Subsystem: LLMDRouterCoordinatorSubsystem,
 			Name:      "encode_subrequests",
-			Help:      metricsutil.HelpMsgWithStability("Number of Encode subrequests produced by one client request. Observed once per pipeline execution after fan-out is known; 0 when Encode does not run or is skipped. Unit: subrequests.", compbasemetrics.ALPHA),
+			Help:      metricsutil.HelpMsgWithStability("Number of Encode subrequests produced by one client request, one per distinct media item. Observed once per pipeline execution after fan-out is known; 0 when Encode does not run or is skipped. Unit: subrequests.", compbasemetrics.ALPHA),
 			Buckets:   CountBuckets,
 		},
 		routeLabel,
